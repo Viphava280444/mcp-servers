@@ -1,0 +1,41 @@
+{
+  "_comment": "Example config for the submit_status MCP server. Copy this to config.json (or point $SUBMIT_STATUS_CONFIG at it) and edit for your cluster. JSON has no comment syntax, so keys prefixed with _ are documentation and are ignored by the server.",
+
+  "_comment_ssh": "How to ssh in. domain is appended to bare hostnames (host -> host.<domain>); set it to \"\" to use hostnames verbatim. timeout is per-command seconds. user/key are the ssh login user and private key path; leave them \"\" to use ssh defaults, or override at runtime with the SUBMIT_SSH_USER / SUBMIT_SSH_KEY env vars (those take precedence).",
+  "ssh": {
+    "domain": "example.org",
+    "timeout": 30,
+    "user": "clusteradmin",
+    "key": "~/.ssh/id_ed25519_cluster"
+  },
+
+  "_comment_node_groups": "Named groups the agent can target by role instead of guessing hostnames. Any group may be empty. The 'all' group is derived automatically as the union of every group below, so you don't list it here (set it explicitly only if you want a custom 'all').",
+  "node_groups": {
+    "login":   ["login01", "login02"],
+    "compute": ["node01", "node02", "node03", "node04"],
+    "gpu":     ["gpu01", "gpu02"],
+    "storage": ["store01", "store02"]
+  },
+
+  "_comment_allowed_commands": "The command whitelist IS the safety model: every command here must be read-only. Map each base command to either null (any arguments allowed) or a list (only those values allowed as the FIRST argument, e.g. a subcommand). Anything not listed is rejected.",
+  "allowed_commands": {
+    "ls":          null,
+    "cd":          null,
+    "pwd":         null,
+    "cat":         null,
+    "head":        null,
+    "tail":        null,
+    "du":          null,
+    "df":          null,
+    "free":        null,
+    "uptime":      null,
+    "uname":       null,
+    "w":           null,
+    "journalctl":  null,
+    "systemctl":   ["status", "list-units", "show", "is-active", "is-enabled"],
+    "scontrol":    ["show", "ping", "version"],
+    "sinfo":       null,
+    "squeue":      null,
+    "nvidia-smi":  null
+  }
+}
