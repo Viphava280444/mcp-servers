@@ -5,12 +5,12 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "archi-mcp-servers"
 version = "0.1.0"
-description = "MCP servers for archi deployments (submit_status: read-only remote diagnostics over ssh)."
+description = "MCP servers for archi deployments."
 requires-python = ">=3.10"
 dependencies = ["mcp"]
 
 [tool.setuptools]
-packages = ["submit_status"]
+packages = ["remote_diagnostic"]
 
 [tool.setuptools.package-data]
-submit_status = ["config.example.json"]
+remote_diagnostic = ["config.example.json"]

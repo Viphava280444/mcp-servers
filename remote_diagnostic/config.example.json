@@ -1,7 +1,7 @@
 {
-  "_comment": "Example config for the submit_status MCP server. Copy this to config.json (or point $SUBMIT_STATUS_CONFIG at it) and edit for your cluster. JSON has no comment syntax, so keys prefixed with _ are documentation and are ignored by the server.",
+  "_comment": "Example config for the remote_diagnostic MCP server. Copy this to config.json (or point $REMOTE_DIAGNOSTIC_CONFIG at it) and edit for your cluster. JSON has no comment syntax, so keys prefixed with _ are documentation and are ignored by the server.",
 
-  "_comment_ssh": "How to ssh in. domain is appended to bare hostnames (host -> host.<domain>); set it to \"\" to use hostnames verbatim. timeout is per-command seconds. user/key are the ssh login user and private key path; leave them \"\" to use ssh defaults, or override at runtime with the SUBMIT_SSH_USER / SUBMIT_SSH_KEY env vars (those take precedence).",
+  "_comment_ssh": "How to ssh in. domain is appended to bare hostnames (host -> host.<domain>); set it to \"\" to use hostnames verbatim. timeout is per-command seconds. user/key are the ssh login user and private key path; override at runtime with the REMOTE_DIAGNOSTIC_SSH_USER / REMOTE_DIAGNOSTIC_SSH_KEY env vars (those take precedence). Leave all of them \"\" to use the running account's own ssh identity — the right choice when the server runs under an admin account whose keys are already authorized on the nodes.",
   "ssh": {
     "domain": "example.org",
     "timeout": 30,
@@ -17,7 +17,11 @@
     "storage": ["store01", "store02"]
   },
 
-  "_comment_allowed_commands": "The command whitelist IS the safety model: every command here must be read-only. Map each base command to either null (any arguments allowed) or a list (only those values allowed as the FIRST argument, e.g. a subcommand). Anything not listed is rejected.",
+  "_comment_control_host": "Optional. Commands listed in cluster_wide_commands query a central controller and return the same answer from any node, so they always run once on default_control_host instead of fanning out over the targeted group. default_control_host must be one of the nodes above.",
+  "default_control_host": "login01",
+  "cluster_wide_commands": ["sinfo", "squeue", "scontrol"],
+
+  "_comment_allowed_commands": "The command whitelist IS the safety model: every allowed form must be read-only (commands may run with elevated privileges on the remote side). Map each base command to one of: null (any arguments); a list of allowed argument PREFIXES — the call's arguments must start with one of the entries, matched token-by-token ('osd df' allows `osd df detail` but not `osd out 3`), a token ending in '*' matches by prefix ('--query-gpu=*'), and an empty list allows only the bare command; or an object {\"allowed\": <null|list>, \"denied\": [tokens]} where denied tokens are rejected wherever they appear (use it to ban a read-only command's mutating flags). Anything not listed is rejected.",
   "allowed_commands": {
     "ls":          null,
     "cd":          null,
@@ -31,11 +35,14 @@
     "uptime":      null,
     "uname":       null,
     "w":           null,
-    "journalctl":  null,
+    "mount":       [],
+    "findmnt":     null,
+    "journalctl":  {"allowed": null, "denied": ["--vacuum*", "--rotate", "--flush", "--sync", "--relinquish*", "--setup-keys", "--update-catalog"]},
     "systemctl":   ["status", "list-units", "show", "is-active", "is-enabled"],
+    "ceph":        ["-s", "status", "health", "df", "osd df", "osd tree", "osd stat", "mon stat"],
     "scontrol":    ["show", "ping", "version"],
     "sinfo":       null,
     "squeue":      null,
-    "nvidia-smi":  null
+    "nvidia-smi":  {"allowed": ["-L", "-q", "--query-gpu=*", "--query-compute-apps=*"], "denied": ["-r", "--gpu-reset", "-pm", "--persistence-mode", "-e", "-p", "-rac", "-ac", "-lgc", "-rgc", "-lmc", "-rmc", "-pl", "-am", "-caa", "-c", "--gom", "-fdm", "-mig"]}
   }
 }

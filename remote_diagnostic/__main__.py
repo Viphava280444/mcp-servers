@@ -1,3 +1,3 @@
-from submit_status.server import mcp
+from remote_diagnostic.server import mcp
 
 mcp.run()

@@ -19,7 +19,7 @@ except ImportError:
 
 logger = get_logger(__name__)
 
-mcp = FastMCP("submit-status")
+mcp = FastMCP("remote_diagnostic")
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -27,42 +27,63 @@ mcp = FastMCP("submit-status")
 # Everything that ties this server to a particular cluster — which nodes exist,
 # which commands are allowed, and how to ssh in — lives in an external JSON config
 # rather than being hardcoded here, so the same server can drive any set of machines.
-# Load order: the file named by $SUBMIT_STATUS_CONFIG, else config.json next to this
-# module. SSH user/key may also come from the env (handy for injecting secrets into a
-# container) and, when set, take precedence over the file.
+# Load order: the file named by $REMOTE_DIAGNOSTIC_CONFIG, else config.json next to this
+# module.
 #
 # Config schema (see config.json):
 #   {
 #     "ssh": {"domain": "mit.edu", "timeout": 30, "user": "", "key": ""},
 #     "node_groups": {"login": ["host00", ...], "gpu": [], ...},
-#     "allowed_commands": {"ls": null, "scontrol": ["show", "ping"], ...}
+#     "allowed_commands": {
+#       "ls": null,
+#       "scontrol": ["show", "ping"],
+#       "ceph": ["-s", "health", "osd df", "osd tree"],
+#       "nvidia-smi": {"allowed": ["-L", "-q", "--query-gpu=*"], "denied": ["-r", "-pm"]}
+#     }
 #   }
-# In allowed_commands, null means "any arguments are allowed"; a list restricts the
-# first argument to those values. This whitelist is the tool's whole safety model, so
-# it is always enforced and must be configured at deploy time — never by the agent.
+# In allowed_commands each value is one of:
+#   * null — any arguments are allowed;
+#   * a list of allowed argument prefixes — the call's arguments must start with one of
+#     the entries. An entry is split on spaces and matched token-by-token ("osd df"
+#     allows `osd df` and `osd df detail`, but not `osd out 3`); a token ending in "*"
+#     matches any argument with that prefix ("--query-gpu=*"). A single-token entry
+#     therefore restricts just the first argument, and an empty list allows only the
+#     bare command with no arguments;
+#   * an object {"allowed": <null or list as above>, "denied": [tokens]} — "denied"
+#     rejects the call if ANY argument matches one of its entries (same token syntax),
+#     wherever it appears. Use it to strip mutating flags from otherwise read-only
+#     commands (e.g. journalctl --vacuum-*).
+# This whitelist is the tool's whole safety model — commands may run with elevated
+# privileges on the remote side, so every allowed form must be read-only. It is always
+# enforced and must be configured at deploy time — never by the agent.
 
-_CONFIG_PATH = Path(os.environ.get("SUBMIT_STATUS_CONFIG") or Path(__file__).with_name("config.json"))
+_CONFIG_PATH = Path(os.environ.get("REMOTE_DIAGNOSTIC_CONFIG") or Path(__file__).with_name("config.json"))
 
 try:
     _CONFIG: dict = json.loads(_CONFIG_PATH.read_text())
 except (OSError, json.JSONDecodeError) as exc:
     raise RuntimeError(
-        f"Could not load submit-status config from {_CONFIG_PATH}: {exc}. "
-        f"Point $SUBMIT_STATUS_CONFIG at your config file, or copy config.example.json "
+        f"Could not load remote_diagnostic config from {_CONFIG_PATH}: {exc}. "
+        f"Point $REMOTE_DIAGNOSTIC_CONFIG at your config file, or copy config.example.json "
         f"to config.json next to this module."
     ) from exc
 
 _ssh_cfg: dict = _CONFIG.get("ssh", {})
 
-# SSH user and key to connect as. The container often runs as root while the nodes only
-# authorize the cluster user's key, so env vars override the config file to allow
-# injecting these as secrets. The resulting command is: ssh -i <key> -l <user> <host> <cmd>
-_SSH_USER: str = os.environ.get("SUBMIT_SSH_USER") or _ssh_cfg.get("user", "")
-_SSH_KEY: str  = os.path.expanduser(os.environ.get("SUBMIT_SSH_KEY") or _ssh_cfg.get("key", ""))
 # Domain suffix appended to bare hostnames (host -> host.<domain>). Set to "" to use
 # hostnames verbatim. Hosts that already contain a "." are always left untouched.
 _DOMAIN: str = _ssh_cfg.get("domain", "")
 _SSH_TIMEOUT: int = int(_ssh_cfg.get("timeout", 30))
+
+# SSH login identity. The REMOTE_DIAGNOSTIC_SSH_USER / REMOTE_DIAGNOSTIC_SSH_KEY env vars
+# take precedence over the config's ssh.user / ssh.key, so a deployment can set them from its
+# secrets/env-file without editing the config. With a user set, remote commands run as that
+# service account rather than as whatever account this process runs under. Leave both unset
+# for deployments that should use the running account's own ssh identity — e.g. an admin
+# deploy where the container runs as root with the admin's ~/.ssh mounted at /root/.ssh: ssh
+# then defaults to the local username and keys, honoring any ~/.ssh/config.
+_SSH_USER: str = os.environ.get("REMOTE_DIAGNOSTIC_SSH_USER") or _ssh_cfg.get("user") or ""
+_SSH_KEY: str = os.path.expanduser(os.environ.get("REMOTE_DIAGNOSTIC_SSH_KEY") or _ssh_cfg.get("key") or "")
 
 # Group aliases for the `machine` argument so the agent can target nodes by role
 # instead of guessing host names. Empty groups report a clear message. The "all" group
@@ -77,12 +98,80 @@ if "all" not in _NODE_GROUPS:
 
 _ALL_NODES_SET: set[str] = {host for nodes in _NODE_GROUPS.values() for host in nodes}
 
-# Whitelist of base commands. null in the config -> None here (any args); a list -> set
-# restricting the first argument. None of these may mutate the remote host.
-_ALLOWED_COMMANDS: dict[str, set[str] | None] = {
-    cmd: (None if allowed is None else set(allowed))
-    for cmd, allowed in _CONFIG.get("allowed_commands", {}).items()
+# Cluster-wide commands return the same answer regardless of which node runs them (they
+# query a central controller/collector), so fanning them out across a group only duplicates
+# output and turns an unrelated node outage into a spurious failure. When one is requested,
+# the server runs it ONCE on `default_control_host` instead of on every resolved host. Both
+# fields are generic: the command names are opaque strings here — the server needs no
+# knowledge of what any of them do.
+_DEFAULT_CONTROL_HOST: str = str(_CONFIG.get("default_control_host", "") or "")
+_CLUSTER_WIDE_COMMANDS: frozenset[str] = frozenset(_CONFIG.get("cluster_wide_commands", []))
+
+if _DEFAULT_CONTROL_HOST and _DEFAULT_CONTROL_HOST not in _ALL_NODES_SET:
+    raise RuntimeError(
+        f"remote_diagnostic config {_CONFIG_PATH} sets default_control_host="
+        f"'{_DEFAULT_CONTROL_HOST}', which is not one of the configured nodes "
+        f"{sorted(_ALL_NODES_SET)}. cluster_wide_commands would route to an unknown host."
+    )
+
+# Whitelist of base commands, parsed from the config forms documented above into
+# (allowed_prefixes, denied_tokens) rules. allowed_prefixes is None for "any args",
+# else a list of token-lists the call's args must start with; denied_tokens are
+# rejected wherever they appear. None of the allowed forms may mutate the remote host.
+
+
+def _token_matches(pattern: str, token: str) -> bool:
+    """One whitelist token against one argument: exact match, or prefix when the
+    pattern ends in '*' (e.g. '--query-gpu=*')."""
+    if pattern.endswith("*"):
+        return token.startswith(pattern[:-1])
+    return token == pattern
+
+
+def _parse_command_rule(command: str, raw) -> tuple[list[list[str]] | None, list[str]]:
+    if raw is None:
+        return None, []
+    if isinstance(raw, list):
+        allowed, denied = raw, []
+    elif isinstance(raw, dict):
+        allowed, denied = raw.get("allowed"), list(raw.get("denied") or [])
+    else:
+        raise RuntimeError(
+            f"remote_diagnostic config {_CONFIG_PATH}: allowed_commands['{command}'] must be "
+            f"null, a list of argument prefixes, or an object with 'allowed'/'denied' — got "
+            f"{type(raw).__name__}."
+        )
+    prefixes = None if allowed is None else [str(entry).split() for entry in allowed]
+    return prefixes, [str(entry) for entry in denied]
+
+
+_ALLOWED_COMMANDS: dict[str, tuple[list[list[str]] | None, list[str]]] = {
+    cmd: _parse_command_rule(cmd, raw)
+    for cmd, raw in _CONFIG.get("allowed_commands", {}).items()
 }
+
+# Commands that run one of their arguments as another command (ssh host "<cmd>",
+# sh -c "<cmd>", xargs <cmd>, find . -exec <cmd>). The whitelist validates only the base
+# command and at most its first argument — never a command nested in an argument — so
+# whitelisting any of these would let the agent smuggle an unchecked command past it.
+# They must never appear in allowed_commands. Validated at startup (below) so an unsafe
+# config fails loudly at deploy time instead of silently widening what can run.
+_COMMAND_INTERPRETERS: frozenset[str] = frozenset({
+    "ssh", "scp", "sftp", "rsync", "telnet",
+    "sh", "bash", "dash", "zsh", "ksh", "fish", "csh", "tcsh",
+    "env", "eval", "exec", "command", "nohup", "setsid", "nice", "ionice", "timeout",
+    "xargs", "find", "watch", "flock", "stdbuf", "su", "sudo", "screen", "tmux", "at",
+    "perl", "python", "python2", "python3", "ruby", "awk", "gawk", "sed",
+})
+
+_interpreters_whitelisted = _ALLOWED_COMMANDS.keys() & _COMMAND_INTERPRETERS
+if _interpreters_whitelisted:
+    raise RuntimeError(
+        f"remote_diagnostic config {_CONFIG_PATH} whitelists command interpreter(s) "
+        f"{sorted(_interpreters_whitelisted)}. Each runs another command supplied as its "
+        f"argument, which the whitelist never inspects — so allowing one lets any command "
+        f"run on any node, defeating the whitelist. Remove it from allowed_commands."
+    )
 
 
 def _ssh_opts() -> list[str]:
@@ -91,10 +180,13 @@ def _ssh_opts() -> list[str]:
         "-o", "ConnectTimeout=5",
         "-o", "StrictHostKeyChecking=accept-new",
     ]
-    if _SSH_KEY:
-        opts += ["-i", _SSH_KEY]
+    # Connect as the configured service account, using its key when provided. When neither is
+    # configured, ssh falls back to the account this process runs under and its default keys
+    # (the admin-deploy model — see the identity notes above).
     if _SSH_USER:
         opts += ["-l", _SSH_USER]
+    if _SSH_KEY:
+        opts += ["-i", _SSH_KEY]
     return opts
 
 
@@ -104,7 +196,7 @@ def _validate_machine(machine: str, allowed: set[str]) -> str | None:
         hint = f" Did you mean '{suggestion[0]}'?" if suggestion else ""
         return (
             f"Unknown node '{machine}'.{hint} You can target a single node, a list "
-            f"('submit00 submit01'), a range ('submit00-08'), or a group "
+            f"('machine00 machine01'), a range ('machine00-08'), or a group "
             f"({sorted(_NODE_GROUPS)}). Valid nodes: {sorted(allowed)}"
         )
     return None
@@ -114,7 +206,7 @@ def _resolve_hosts(machine: str) -> tuple[list[str], str | None]:
     """Resolve a machine spec into validated node names, forgiving the formats the
     agent naturally produces. Accepts a single node, a space/comma-separated list,
     a group name (all/login/ceph/scratch/gpu/cpu, case-insensitive), and ranges
-    like 'submit00-08'. Returns (hosts, error)."""
+    like 'machine00-08'. Returns (hosts, error)."""
     hosts: list[str] = []
     for token in machine.replace(",", " ").split():
         key = token.lower()
@@ -137,8 +229,8 @@ def _resolve_hosts(machine: str) -> tuple[list[str], str | None]:
     deduped = [h for h in hosts if not (h in seen or seen.add(h))]
     if not deduped:
         return [], (
-            "No machine specified. Use a node ('submit00'), a list, a range "
-            f"('submit00-08'), or a group ({sorted(_NODE_GROUPS)})."
+            "No machine specified. Use a node ('machine00'), a list, a range "
+            f"('machine00-08'), or a group ({sorted(_NODE_GROUPS)})."
         )
     for host in deduped:
         if err := _validate_machine(host, _ALL_NODES_SET):
@@ -148,9 +240,12 @@ def _resolve_hosts(machine: str) -> tuple[list[str], str | None]:
 
 async def _ssh(host: str, command: str, timeout: int = _SSH_TIMEOUT) -> tuple[str, str]:
     """Run a command over ssh. Returns (status, output). status is "ok" on success, or
-    one of "command" (the remote command exited non-zero), "connect" (ssh itself could
-    not reach the host — exit 255, often a down/unreachable node), or "timeout".
-    Distinguishing these lets callers hand the agent an accurate recovery hint."""
+    one of "command" (the remote command exited non-zero), "auth" (ssh reached the host but
+    login was rejected — the node is up, we just can't authenticate), "connect" (ssh could
+    not reach the host at all — often a down/unreachable node), or "timeout". ssh uses exit
+    255 for both auth and connect failures, so we split them on the stderr text; getting this
+    right matters because "can't log in" and "node is down" lead the agent to opposite
+    conclusions. Distinguishing these lets callers hand the agent an accurate recovery hint."""
     fqdn = host if ("." in host or not _DOMAIN) else f"{host}.{_DOMAIN}"
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -164,8 +259,13 @@ async def _ssh(host: str, command: str, timeout: int = _SSH_TIMEOUT) -> tuple[st
             return "ok", stdout.decode().strip()
         error = stderr.decode().strip() or f"ssh exited with code {proc.returncode}"
         # ssh reserves exit 255 for its own failures (connect/auth); any other code is
-        # the remote command's own exit status.
-        status = "connect" if proc.returncode == 255 else "command"
+        # the remote command's own exit status. An exit-255 whose stderr mentions an auth
+        # rejection means the host is reachable but won't let us in — not that it is down.
+        if proc.returncode == 255:
+            low = error.lower()
+            status = "auth" if any(s in low for s in ("permission denied", "publickey", "authentication")) else "connect"
+        else:
+            status = "command"
         logger.warning("ssh %s: %s failure (rc=%d): %s", host, status, proc.returncode, error)
         return status, error
     except asyncio.TimeoutError:
@@ -186,18 +286,32 @@ _CWD: dict[str, str] = {}
 
 
 def _validate_command(command: str, args: list[str]) -> str | None:
-    allowed_first_args = _ALLOWED_COMMANDS.get(command)
-    if allowed_first_args is None and command not in _ALLOWED_COMMANDS:
+    if command not in _ALLOWED_COMMANDS:
         suggestion = get_close_matches(command, _ALLOWED_COMMANDS, n=1)
         hint = f" Did you mean '{suggestion[0]}'?" if suggestion else ""
         return f"Command '{command}' is not whitelisted.{hint} Allowed: {sorted(_ALLOWED_COMMANDS)}"
-    if allowed_first_args is not None and args and args[0] not in allowed_first_args:
-        suggestion = get_close_matches(args[0], allowed_first_args, n=1)
-        hint = f" Did you mean '{suggestion[0]}'?" if suggestion else ""
-        return (
-            f"Argument '{args[0]}' is not allowed as the first argument to '{command}'.{hint} "
-            f"Allowed: {sorted(allowed_first_args)}"
-        )
+    allowed_prefixes, denied_tokens = _ALLOWED_COMMANDS[command]
+    for arg in args:
+        for denied in denied_tokens:
+            if _token_matches(denied, arg):
+                return (
+                    f"Argument '{arg}' is not allowed with '{command}' (it can change remote "
+                    f"state; this tool is read-only). Drop it and retry."
+                )
+    if allowed_prefixes is not None and args:
+        if not any(
+            len(args) >= len(prefix) and all(_token_matches(p, a) for p, a in zip(prefix, args))
+            for prefix in allowed_prefixes
+        ):
+            if not allowed_prefixes:
+                return f"'{command}' is whitelisted only as a bare command — call it with no arguments."
+            rendered = sorted(" ".join(prefix) for prefix in allowed_prefixes)
+            suggestion = get_close_matches(args[0], [p[0] for p in allowed_prefixes if p], n=1)
+            hint = f" Did you mean '{suggestion[0]}'?" if suggestion else ""
+            return (
+                f"'{command} {' '.join(args)}' is not whitelisted: the arguments must start "
+                f"with one of these forms.{hint} Allowed for '{command}': {rendered}"
+            )
     return None
 
 
@@ -214,11 +328,26 @@ def _format_error(host: str, command: str, args: list[str], status: str, error: 
             f"may be producing far too much output — narrow it (add filters/limits, fewer paths) "
             f"and retry; check load with uptime."
         )
+    elif status == "auth":
+        hint = (
+            f"ssh REACHED {host} but login was rejected for this tool's account — this is an "
+            f"authentication failure, NOT the node being down and NOT about your command. {host} "
+            f"is almost certainly up. Do not report it as down or unreachable, and do not infer "
+            f"anything about its state from this. Treat it as 'could not authenticate to {host}' "
+            f"and base your conclusions on the nodes that did respond."
+        )
     elif status == "connect":
         hint = (
             f"ssh could not reach {host}, so the node may genuinely be unreachable or down. Unlike "
             f"a command error this is NOT about your arguments — the same command may work on other "
             f"nodes. Try another node, or report {host} as unreachable if it persists."
+        )
+    elif "permission denied" in error.lower() or "operation not permitted" in error.lower():
+        hint = (
+            f"the command ran on {host} but was DENIED access (this tool logs in as an unprivileged "
+            f"user, not root). You did NOT see the contents, so you do NOT know this file's/dir's "
+            f"state — do not infer or assert what it contains. If that state matters to your answer, "
+            f"say plainly that it was permission-denied and could not be verified rather than guessing."
         )
     else:
         hint = (
@@ -259,10 +388,19 @@ def _inventory_text() -> str:
         else:
             lines.append(f"* {name}: (none configured)")
 
-    lines += ["", 'Allowed commands (base command -> allowed first argument; "any" = unrestricted):']
+    lines += ["", 'Allowed commands (base command -> allowed argument forms; "any" = unrestricted,',
+              '"no arguments" = bare command only; args must START WITH one of the listed forms):']
     for cmd in sorted(_ALLOWED_COMMANDS):
-        allowed = _ALLOWED_COMMANDS[cmd]
-        lines.append(f"* {cmd}: {'any' if allowed is None else ', '.join(sorted(allowed))}")
+        allowed_prefixes, denied_tokens = _ALLOWED_COMMANDS[cmd]
+        if allowed_prefixes is None:
+            desc = "any"
+        elif not allowed_prefixes:
+            desc = "no arguments"
+        else:
+            desc = ", ".join(sorted(" ".join(prefix) for prefix in allowed_prefixes))
+        if denied_tokens:
+            desc += f"  [never: {', '.join(sorted(denied_tokens))}]"
+        lines.append(f"* {cmd}: {desc}")
     return "\n".join(lines)
 
 
@@ -294,13 +432,20 @@ async def run_diagnostic(machine: str, command: str, args: list[str] | None = No
     * Range: "host00-08" (expands to host00..host08)
     * Group: a group name from CONFIGURED INVENTORY, or "all" for every configured node
     Output from multiple nodes is returned grouped under "### <hostname>" headings.
+    Some commands are cluster-wide (they query a central controller and return the same
+    answer from any node); these run once on the deployment's control host regardless of the
+    `machine` you pass, so you never get duplicated per-node output for them.
 
     COMMANDS (command):
     Only whitelisted base commands are allowed, and every one is read-only. Some commands
-    further restrict their first argument (e.g. a subcommand). The exact whitelist for this
-    deployment — base commands and any first-argument restrictions — is listed under
-    CONFIGURED INVENTORY below. If a command or argument is rejected, the error names what
-    is allowed.
+    also restrict their arguments: the call's arguments must start with one of the listed
+    forms (e.g. "osd df" allows `osd df detail` but not `osd out`), and a few flags are
+    banned outright. The exact whitelist for this deployment is listed under CONFIGURED
+    INVENTORY below. If a command or argument is rejected, the error names what is allowed.
+    If a command you want isn't whitelisted, do NOT try to reach it indirectly — running it
+    through another command (ssh, sh -c, xargs, find -exec) or hopping to a second node is
+    rejected and only wastes a turn. Use a whitelisted command instead, or say the command
+    you need isn't available.
 
     PREFER STRUCTURED OUTPUT:
     When a command supports a machine-readable flag, pass it — JSON/long formats are far
@@ -352,11 +497,16 @@ async def run_diagnostic(machine: str, command: str, args: list[str] | None = No
     if err:
         return err
 
+    # Cluster-wide commands (e.g. scheduler / pool queries) return the same result from any
+    # node, so run once on the control host rather than fanning out across the resolved group
+    # — this dedupes output and avoids spurious failures from nodes that don't need contacting.
+    # Config-driven and command-agnostic (see _CLUSTER_WIDE_COMMANDS / _DEFAULT_CONTROL_HOST).
+    if _DEFAULT_CONTROL_HOST and command in _CLUSTER_WIDE_COMMANDS:
+        hosts = [_DEFAULT_CONTROL_HOST]
+
     async def _run_and_format(host):
         ok, out = await _run_on_host(host, command, args)
         if not ok:
-            # Error blocks carry their own recovery hint — return verbatim so a
-            # grep_pattern or pagination window can't hide the failure.
             return out
 
         lines = out.splitlines()
