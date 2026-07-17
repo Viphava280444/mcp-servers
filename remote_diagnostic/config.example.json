@@ -17,9 +17,9 @@
     "storage": ["store01", "store02"]
   },
 
-  "_comment_control_host": "Optional. Commands listed in cluster_wide_commands query a central controller and return the same answer from any node, so they always run once on default_control_host instead of fanning out over the targeted group. default_control_host must be one of the nodes above.",
+  "_comment_control_host": "Optional. Commands listed in cluster_wide_commands query a central controller and return the same answer from any node, so they always run once on a control host instead of fanning out over the targeted group. Use a list to run them all on default_control_host, or a mapping of command -> host when a command's controller lives elsewhere (e.g. ceph needs a node with a keyring); a null mapped host falls back to default_control_host. Every control host must be one of the nodes above.",
   "default_control_host": "login01",
-  "cluster_wide_commands": ["sinfo", "squeue", "scontrol"],
+  "cluster_wide_commands": {"sinfo": null, "squeue": null, "scontrol": null, "ceph": "store01"},
 
   "_comment_allowed_commands": "The command whitelist IS the safety model: every allowed form must be read-only (commands may run with elevated privileges on the remote side). Map each base command to one of: null (any arguments); a list of allowed argument PREFIXES — the call's arguments must start with one of the entries, matched token-by-token ('osd df' allows `osd df detail` but not `osd out 3`), a token ending in '*' matches by prefix ('--query-gpu=*'), and an empty list allows only the bare command; or an object {\"allowed\": <null|list>, \"denied\": [tokens]} where denied tokens are rejected wherever they appear (use it to ban a read-only command's mutating flags). Anything not listed is rejected.",
   "allowed_commands": {

@@ -4,6 +4,7 @@ import os
 import re
 import shlex
 
+from collections import Counter
 from difflib import get_close_matches
 from pathlib import Path
 from mcp.server.fastmcp import FastMCP
@@ -101,11 +102,21 @@ _ALL_NODES_SET: set[str] = {host for nodes in _NODE_GROUPS.values() for host in 
 # Cluster-wide commands return the same answer regardless of which node runs them (they
 # query a central controller/collector), so fanning them out across a group only duplicates
 # output and turns an unrelated node outage into a spurious failure. When one is requested,
-# the server runs it ONCE on `default_control_host` instead of on every resolved host. Both
-# fields are generic: the command names are opaque strings here — the server needs no
-# knowledge of what any of them do.
+# the server runs it ONCE on a control host instead of on every resolved host. The config
+# accepts a list (every command runs on `default_control_host`) or a mapping of command ->
+# control host for commands whose controller lives elsewhere (e.g. ceph needs a node with a
+# keyring); a null/empty mapped host falls back to `default_control_host`. Both fields are
+# generic: the command names are opaque strings here — the server needs no knowledge of
+# what any of them do.
 _DEFAULT_CONTROL_HOST: str = str(_CONFIG.get("default_control_host", "") or "")
-_CLUSTER_WIDE_COMMANDS: frozenset[str] = frozenset(_CONFIG.get("cluster_wide_commands", []))
+_raw_cluster_wide = _CONFIG.get("cluster_wide_commands", [])
+if isinstance(_raw_cluster_wide, dict):
+    _CLUSTER_WIDE_COMMANDS: dict[str, str] = {
+        str(cmd): str(host or "") or _DEFAULT_CONTROL_HOST
+        for cmd, host in _raw_cluster_wide.items()
+    }
+else:
+    _CLUSTER_WIDE_COMMANDS = {str(cmd): _DEFAULT_CONTROL_HOST for cmd in _raw_cluster_wide}
 
 if _DEFAULT_CONTROL_HOST and _DEFAULT_CONTROL_HOST not in _ALL_NODES_SET:
     raise RuntimeError(
@@ -113,6 +124,17 @@ if _DEFAULT_CONTROL_HOST and _DEFAULT_CONTROL_HOST not in _ALL_NODES_SET:
         f"'{_DEFAULT_CONTROL_HOST}', which is not one of the configured nodes "
         f"{sorted(_ALL_NODES_SET)}. cluster_wide_commands would route to an unknown host."
     )
+for _cmd, _host in _CLUSTER_WIDE_COMMANDS.items():
+    if not _host:
+        raise RuntimeError(
+            f"remote_diagnostic config {_CONFIG_PATH} lists cluster-wide command '{_cmd}' "
+            f"but no control host: set default_control_host or map the command to a host."
+        )
+    if _host not in _ALL_NODES_SET:
+        raise RuntimeError(
+            f"remote_diagnostic config {_CONFIG_PATH} routes cluster-wide command '{_cmd}' "
+            f"to '{_host}', which is not one of the configured nodes {sorted(_ALL_NODES_SET)}."
+        )
 
 # Whitelist of base commands, parsed from the config forms documented above into
 # (allowed_prefixes, denied_tokens) rules. allowed_prefixes is None for "any args",
@@ -257,7 +279,13 @@ async def _ssh(host: str, command: str, timeout: int = _SSH_TIMEOUT) -> tuple[st
         if proc.returncode == 0:
             logger.info("ssh %s: command succeeded: %s", host, command)
             return "ok", stdout.decode().strip()
-        error = stderr.decode().strip() or f"ssh exited with code {proc.returncode}"
+        # ssh host-key chatter ("Warning: Permanently added ...", "Failed to add the host
+        # to the list of known hosts" when ~/.ssh is read-only) is noise that varies per
+        # host and would bloat every error block — drop it before formatting.
+        error = "\n".join(
+            line for line in stderr.decode().splitlines()
+            if "list of known hosts" not in line
+        ).strip() or f"ssh exited with code {proc.returncode}"
         # ssh reserves exit 255 for its own failures (connect/auth); any other code is
         # the remote command's own exit status. An exit-255 whose stderr mentions an auth
         # rejection means the host is reachable but won't let us in — not that it is down.
@@ -433,8 +461,17 @@ async def run_diagnostic(machine: str, command: str, args: list[str] | None = No
     * Group: a group name from CONFIGURED INVENTORY, or "all" for every configured node
     Output from multiple nodes is returned grouped under "### <hostname>" headings.
     Some commands are cluster-wide (they query a central controller and return the same
-    answer from any node); these run once on the deployment's control host regardless of the
+    answer from any node); these run once on that command's control host regardless of the
     `machine` you pass, so you never get duplicated per-node output for them.
+
+    MULTI-NODE FAN-OUT DIGEST:
+    When you target 3+ nodes and the combined output is large, the result is compacted:
+    one typical host's output is shown in full (the baseline), every other host appears
+    only as a line diff against it ("+" = line only on that host, "-" = baseline line
+    missing there), and hosts identical to the baseline are just listed by name. This is
+    lossless for reasoning: a host absent from the diffs matches the baseline exactly.
+    Cluster-wide surveys are therefore cheap — prefer one fan-out call over per-node calls.
+    With `start_line`, pagination applies to the baseline output.
 
     COMMANDS (command):
     Only whitelisted base commands are allowed, and every one is read-only. Some commands
@@ -486,6 +523,10 @@ async def run_diagnostic(machine: str, command: str, args: list[str] | None = No
     * machine="host00-08", command="df", args=["-h", "/scratch"]
     * command="systemctl", args=["status", "condor.service"], grep_pattern="Active:"
     * command="condor_q", args=["-json"]
+    * command="condor_status", args=["-compact", "submit06.mit.edu"]
+      (machine names are positional args — there is NO -name option)
+    * command="condor_status", args=["-af", "Machine", "State", "Activity"]
+      (each -af attribute is its own arg, space-separated — NEVER comma-joined)
     * command="cd", args=["/var/log/condor"]
     """
 
@@ -498,50 +539,169 @@ async def run_diagnostic(machine: str, command: str, args: list[str] | None = No
         return err
 
     # Cluster-wide commands (e.g. scheduler / pool queries) return the same result from any
-    # node, so run once on the control host rather than fanning out across the resolved group
-    # — this dedupes output and avoids spurious failures from nodes that don't need contacting.
-    # Config-driven and command-agnostic (see _CLUSTER_WIDE_COMMANDS / _DEFAULT_CONTROL_HOST).
-    if _DEFAULT_CONTROL_HOST and command in _CLUSTER_WIDE_COMMANDS:
-        hosts = [_DEFAULT_CONTROL_HOST]
+    # node, so run once on the command's control host rather than fanning out across the
+    # resolved group — this dedupes output and avoids spurious failures from nodes that don't
+    # need contacting. Config-driven and command-agnostic (see _CLUSTER_WIDE_COMMANDS).
+    control_host = _CLUSTER_WIDE_COMMANDS.get(command)
+    if control_host:
+        hosts = [control_host]
 
     async def _run_and_format(host):
         ok, out = await _run_on_host(host, command, args)
         if not ok:
             return out
-
-        lines = out.splitlines()
-        if grep_pattern:
-            matched = [line for line in lines if grep_pattern in line]
-            if lines and not matched:
-                return (
-                    f"[Command produced {len(lines)} line(s), but none contained '{grep_pattern}'. "
-                    f"If you were filtering noise, loosen or drop the pattern; if you were checking "
-                    f"whether '{grep_pattern}' exists, its absence may itself be the answer.]"
-                )
-            lines = matched
-
-        total_lines = len(lines)
-        if total_lines and start_line >= total_lines:
-            return (
-                f"[start_line={start_line} is past the end of the output ({total_lines} lines). "
-                f"Use a smaller start_line.]"
-            )
-
-        paginated_lines = lines[start_line : start_line + max_lines]
-        out_text = "\n".join(paginated_lines)
-        if not out_text:
-            return "[Command completed with no output.]"
-
-        if start_line + max_lines < total_lines:
-            out_text += f"\n\n...[OUTPUT TRUNCATED. Showing lines {start_line} to {start_line + len(paginated_lines) - 1} of {total_lines}. Pass start_line={start_line + max_lines} to read the next chunk]..."
-
-        return out_text
+        filtered = _apply_grep(out.splitlines(), grep_pattern)
+        if isinstance(filtered, str):
+            return filtered
+        return _paginate(filtered, start_line, max_lines)
 
     if len(hosts) == 1:
         return await _run_and_format(hosts[0])
 
-    outputs = await asyncio.gather(*[_run_and_format(host) for host in hosts])
-    return "\n\n".join(f"### {host}\n{out}" for host, out in zip(hosts, outputs))
+    raw = await asyncio.gather(*[_run_on_host(host, command, args) for host in hosts])
+
+    # Split hosts into diffable line outputs vs terminal messages (errors, grep
+    # misses, empty output) that must be surfaced verbatim rather than diffed.
+    line_entries: list[tuple[str, list[str]]] = []
+    message_entries: list[tuple[str, str]] = []
+    for host, (ok, out) in zip(hosts, raw):
+        if not ok:
+            message_entries.append((host, out))
+            continue
+        filtered = _apply_grep(out.splitlines(), grep_pattern)
+        if isinstance(filtered, str):
+            message_entries.append((host, filtered))
+        elif not filtered:
+            message_entries.append((host, "[Command completed with no output.]"))
+        else:
+            line_entries.append((host, filtered))
+
+    parts: list[str] = []
+    if len(line_entries) >= 3 and sum(len(ls) for _, ls in line_entries) > max_lines:
+        parts.append(_fanout_digest(line_entries, start_line, max_lines))
+    else:
+        parts.extend(
+            f"### {host}\n{_paginate(ls, start_line, max_lines)}" for host, ls in line_entries
+        )
+
+    # Equivalent messages (a grep miss or the same error on many hosts) collapse into
+    # one block listing every affected host. Grouping compares normalized text — error
+    # output embeds timestamps, thread ids, and the host's own name, which would make
+    # every block unique — and shows one representative verbatim.
+    grouped: dict[str, tuple[list[str], str]] = {}
+    for host, msg in message_entries:
+        key = _grouping_key(host, msg)
+        grouped.setdefault(key, ([], msg))[0].append(host)
+    for affected, msg in grouped.values():
+        if len(affected) == 1:
+            parts.append(f"### {affected[0]}\n{msg}")
+        else:
+            parts.append(
+                f"### {', '.join(affected)}\n[Same result on {len(affected)} host(s); "
+                f"representative output from {affected[0]}:]\n{msg}"
+            )
+
+    return "\n\n".join(parts)
+
+
+_TIMESTAMP_RE = re.compile(r"\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[+-]\d{4}|Z)?\b")
+_HEX_ID_RE = re.compile(r"\b(?:0x)?[0-9a-f]{8,16}\b")
+
+
+def _grouping_key(host: str, msg: str) -> str:
+    """Normalize a per-host message so equivalent errors group across hosts."""
+    return _HEX_ID_RE.sub("<id>", _TIMESTAMP_RE.sub("<ts>", msg)).replace(host, "<host>")
+
+
+def _apply_grep(lines: list[str], grep_pattern: str | None) -> list[str] | str:
+    """Filter lines to those containing the pattern; a string result is a terminal
+    message to surface as-is (nothing matched)."""
+    if not grep_pattern:
+        return lines
+    matched = [line for line in lines if grep_pattern in line]
+    if lines and not matched:
+        return (
+            f"[Command produced {len(lines)} line(s), but none contained '{grep_pattern}'. "
+            f"If you were filtering noise, loosen or drop the pattern; if you were checking "
+            f"whether '{grep_pattern}' exists, its absence may itself be the answer.]"
+        )
+    return matched
+
+
+def _paginate(lines: list[str], start_line: int, max_lines: int) -> str:
+    total_lines = len(lines)
+    if total_lines and start_line >= total_lines:
+        return (
+            f"[start_line={start_line} is past the end of the output ({total_lines} lines). "
+            f"Use a smaller start_line.]"
+        )
+
+    paginated_lines = lines[start_line : start_line + max_lines]
+    out_text = "\n".join(paginated_lines)
+    if not out_text:
+        return "[Command completed with no output.]"
+
+    if start_line + max_lines < total_lines:
+        out_text += f"\n\n...[OUTPUT TRUNCATED. Showing lines {start_line} to {start_line + len(paginated_lines) - 1} of {total_lines}. Pass start_line={start_line + max_lines} to read the next chunk]..."
+
+    return out_text
+
+
+def _fanout_digest(line_entries: list[tuple[str, list[str]]], start_line: int, max_lines: int) -> str:
+    """Compact a multi-host fan-out. Cluster nodes are near-identical, so instead of
+    repeating N copies of the same output, show the most typical host in full and
+    every other host as a line diff against it. Bounded: the baseline is paginated
+    as usual and the combined diffs get a fixed line budget — hosts whose diff
+    doesn't fit are named with a drill-down hint instead of inlined."""
+    n = len(line_entries)
+    sets = {host: set(ls) for host, ls in line_entries}
+    counts = Counter(line for line_set in sets.values() for line in line_set)
+    majority = {line for line, c in counts.items() if c > n / 2}
+    ref_host, ref_lines = max(line_entries, key=lambda entry: len(sets[entry[0]] & majority))
+    ref_set = sets[ref_host]
+
+    identical: list[str] = []
+    diff_blocks: list[str] = []
+    deferred: list[tuple[str, int]] = []
+    budget = max_lines * 3
+    for host, ls in line_entries:
+        if host == ref_host:
+            continue
+        extra = [line for line in ls if line not in ref_set]
+        missing = [line for line in ref_lines if line not in sets[host]]
+        if not extra and not missing:
+            identical.append(host)
+            continue
+        size = len(extra) + len(missing)
+        if size > budget:
+            deferred.append((host, size))
+            continue
+        budget -= size
+        block = [f"### {host} (diff vs {ref_host})"]
+        block.extend(f"+ {line}" for line in extra)
+        block.extend(f"- {line}" for line in missing)
+        diff_blocks.append("\n".join(block))
+
+    parts = [
+        (
+            f"[Fan-out digest across {n} host(s): full output shown once for the most typical "
+            f"host ({ref_host}); every other host appears as a diff against it (+ = line only "
+            f"on that host, - = baseline line missing on that host) or in the identical list.]"
+        ),
+        f"### {ref_host} (baseline)\n{_paginate(ref_lines, start_line, max_lines)}",
+        *diff_blocks,
+    ]
+    if identical:
+        parts.append(
+            f"### identical to {ref_host} ({len(identical)} host(s)): {', '.join(identical)}"
+        )
+    if deferred:
+        parts.append(
+            "### diffs too large to inline: "
+            + "; ".join(f"{host} ({size} differing line(s))" for host, size in deferred)
+            + ". Target such a host directly (machine='<host>') to inspect it."
+        )
+    return "\n\n".join(parts)
 
 
 # Register manually (rather than via @mcp.tool()) so the static guidance in the docstring
