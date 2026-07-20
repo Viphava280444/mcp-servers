@@ -33,7 +33,7 @@ mcp = FastMCP("remote_diagnostic")
 #
 # Config schema (see config.json):
 #   {
-#     "ssh": {"domain": "mit.edu", "timeout": 30, "user": "", "key": ""},
+#     "ssh": {"domain": "mit.edu", "timeout": 30},
 #     "node_groups": {"login": ["host00", ...], "gpu": [], ...},
 #     "allowed_commands": {
 #       "ls": null,
@@ -76,15 +76,25 @@ _ssh_cfg: dict = _CONFIG.get("ssh", {})
 _DOMAIN: str = _ssh_cfg.get("domain", "")
 _SSH_TIMEOUT: int = int(_ssh_cfg.get("timeout", 30))
 
-# SSH login identity. The REMOTE_DIAGNOSTIC_SSH_USER / REMOTE_DIAGNOSTIC_SSH_KEY env vars
-# take precedence over the config's ssh.user / ssh.key, so a deployment can set them from its
-# secrets/env-file without editing the config. With a user set, remote commands run as that
-# service account rather than as whatever account this process runs under. Leave both unset
-# for deployments that should use the running account's own ssh identity — e.g. an admin
-# deploy where the container runs as root with the admin's ~/.ssh mounted at /root/.ssh: ssh
-# then defaults to the local username and keys, honoring any ~/.ssh/config.
-_SSH_USER: str = os.environ.get("REMOTE_DIAGNOSTIC_SSH_USER") or _ssh_cfg.get("user") or ""
-_SSH_KEY: str = os.path.expanduser(os.environ.get("REMOTE_DIAGNOSTIC_SSH_KEY") or _ssh_cfg.get("key") or "")
+# SSH login identity. run_diagnostic sshes to the nodes as the account that deployed the
+# service, using that account's own ~/.ssh (mounted into the container) — the operating model
+# is "log into the service account, deploy from there", so this behaves exactly like that
+# operator running `ssh <node>` by hand. The deploying account comes from the environment:
+# ARCHI_DEPLOY_USER (the deploy wrapper sets it to the host username), falling back to
+# SUDO_USER / USER / LOGNAME for non-container runs. 'root' and empty are skipped so a
+# container that runs as root but was deployed by a real account never silently sshes as root.
+# ssh uses that account's default keys in ~/.ssh, honoring any ~/.ssh/config.
+
+
+def _deploying_account() -> str:
+    for var in ("ARCHI_DEPLOY_USER", "SUDO_USER", "USER", "LOGNAME"):
+        val = (os.environ.get(var) or "").strip()
+        if val and val != "root":
+            return val
+    return ""
+
+
+_SSH_USER: str = _deploying_account()
 
 # Group aliases for the `machine` argument so the agent can target nodes by role
 # instead of guessing host names. Empty groups report a clear message. The "all" group
@@ -202,13 +212,10 @@ def _ssh_opts() -> list[str]:
         "-o", "ConnectTimeout=5",
         "-o", "StrictHostKeyChecking=accept-new",
     ]
-    # Connect as the configured service account, using its key when provided. When neither is
-    # configured, ssh falls back to the account this process runs under and its default keys
-    # (the admin-deploy model — see the identity notes above).
+    # Log in as the deploying account (see the identity notes above); its default keys in
+    # ~/.ssh authenticate. With no account resolved, ssh falls back to the local username.
     if _SSH_USER:
         opts += ["-l", _SSH_USER]
-    if _SSH_KEY:
-        opts += ["-i", _SSH_KEY]
     return opts
 
 
