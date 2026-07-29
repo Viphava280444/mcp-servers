@@ -83,7 +83,11 @@ _SSH_TIMEOUT: int = int(_ssh_cfg.get("timeout", 30))
 # ARCHI_DEPLOY_USER (the deploy wrapper sets it to the host username), falling back to
 # SUDO_USER / USER / LOGNAME for non-container runs. 'root' and empty are skipped so a
 # container that runs as root but was deployed by a real account never silently sshes as root.
-# ssh uses that account's default keys in ~/.ssh, honoring any ~/.ssh/config.
+# ssh uses that account's keys in ~/.ssh, honoring any ~/.ssh/config. Accounts whose key does
+# not use one of ssh's default names (id_rsa, id_ed25519, ...) can name it in `ssh.key`. That
+# path is used verbatim inside the container, so the deployment must also bind-mount the key
+# there — under archi, list the same absolute path in this server's `host_file_mounts`, which
+# mounts each entry at an identical path. Leave it empty to let ssh pick the default names.
 
 
 def _deploying_account() -> str:
@@ -95,6 +99,15 @@ def _deploying_account() -> str:
 
 
 _SSH_USER: str = _deploying_account()
+_SSH_KEY: str = os.path.expanduser(str(_ssh_cfg.get("key", "") or ""))
+
+if _SSH_KEY and not os.path.exists(_SSH_KEY):
+    raise RuntimeError(
+        f"remote_diagnostic config {_CONFIG_PATH} sets ssh.key='{_SSH_KEY}', which does not "
+        f"exist here. The path is used verbatim inside the container, so the same absolute path "
+        f"must be bind-mounted in (under archi, add it to this server's host_file_mounts). Fix "
+        f"the path or clear ssh.key to fall back to ssh's default key names."
+    )
 
 # Group aliases for the `machine` argument so the agent can target nodes by role
 # instead of guessing host names. Empty groups report a clear message. The "all" group
@@ -212,10 +225,14 @@ def _ssh_opts() -> list[str]:
         "-o", "ConnectTimeout=5",
         "-o", "StrictHostKeyChecking=accept-new",
     ]
-    # Log in as the deploying account (see the identity notes above); its default keys in
-    # ~/.ssh authenticate. With no account resolved, ssh falls back to the local username.
+    # Log in as the deploying account (see the identity notes above); its keys in ~/.ssh
+    # authenticate. With no account resolved, ssh falls back to the local username.
     if _SSH_USER:
         opts += ["-l", _SSH_USER]
+    # IdentitiesOnly stops ssh from also offering every other key in ~/.ssh, which can exhaust
+    # the server's MaxAuthTries before the configured one is reached.
+    if _SSH_KEY:
+        opts += ["-i", _SSH_KEY, "-o", "IdentitiesOnly=yes"]
     return opts
 
 
