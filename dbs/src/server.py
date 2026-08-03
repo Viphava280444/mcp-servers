@@ -566,6 +566,177 @@ def _envelope(summary: dict[str, Any], subject: str, kind: str, calls: int,
     }
 
 
+GROUP_KEYS = ("auto", "none", "tier", "stream", "version", "status")
+DEFAULT_METRICS = ("count", "bytes", "files", "blocks")
+
+
+def _group_of(dataset: str, row: dict[str, Any], key: str) -> str:
+    parts = dataset.strip("/").split("/")
+    if key == "tier":
+        return parts[2] if len(parts) == 3 else "unknown"
+    if key == "stream":
+        return parts[0] if parts else "unknown"
+    if key == "version":
+        processed = parts[1] if len(parts) == 3 else ""
+        return processed.rsplit("-", 1)[-1] if "-" in processed else (processed or "unknown")
+    if key == "status":
+        return row.get("dataset_access_type") or "unknown"
+    return "all"
+
+
+@mcp.tool()
+def dbs_aggregate(
+    pattern: str,
+    status: str = "VALID",
+    group_by: str = "auto",
+    metrics: list[str] | None = None,
+    count_only: bool = False,
+) -> dict[str, Any]:
+    """Totals and per-group sums over MANY datasets, computed here, not in chat.
+
+    Answers questions like "how much data is in this era, by tier" or "how
+    many datasets match this pattern". `pattern` is a dataset wildcard such as
+    /*/HIRun2026A*/AOD. `status` must be explicit ('VALID', 'INVALID', '*',
+    ...) because the DBS default silently hides everything that is not VALID.
+    `group_by` is auto|none|tier|stream|version|status. `metrics` is any of
+    count, bytes, files, blocks, events. Set `count_only` for a pure count.
+
+    The reply's size follows the number of GROUPS, never the number of
+    datasets, so it is safe on a whole era. Eras are selected by name pattern:
+    there is deliberately no era-name parameter, because the server ignores
+    that filter and answers with the entire catalog.
+    """
+    if group_by not in GROUP_KEYS:
+        raise ValueError(f"group_by must be one of {', '.join(GROUP_KEYS)}")
+    wanted = [m for m in (metrics or list(DEFAULT_METRICS))]
+    client = _dbs_client()
+    calls = 0
+
+    rows = _rows(client.listDatasets(dataset=pattern, dataset_access_type=status, detail=True))
+    calls += 1
+    names = [r.get("dataset") for r in rows if r.get("dataset")]
+    by_name = {r.get("dataset"): r for r in rows}
+    n_matched = len(names)
+
+    if group_by == "auto":
+        tiers = {_group_of(n, by_name[n], "tier") for n in names}
+        group_by = "tier" if len(tiers) > 1 else "none"
+
+    groups: dict[str, dict[str, Any]] = {}
+    for name in names:
+        key = _group_of(name, by_name[name], group_by)
+        groups.setdefault(key, {"group": key, "n_datasets": 0, "datasets": []})
+        groups[key]["n_datasets"] += 1
+        groups[key]["datasets"].append(name)
+
+    coverage = {"n_matched": n_matched, "n_summed": 0, "n_failed": 0,
+                "complete": True, "truncation_reason": None}
+
+    if count_only or n_matched == 0:
+        out_groups = [{"group": g["group"], "n_datasets": g["n_datasets"]}
+                      for g in groups.values()]
+        totals = {"n_datasets": n_matched}
+        hint = ("no datasets match this pattern at status "
+                f"{status}; check the name or widen the status") if n_matched == 0 else \
+               "counts come from dataset names; ask for bytes to pay for the block scan"
+        return _agg_envelope(out_groups, totals, coverage, pattern, status, calls, hint)
+
+    # Sizes: one status-blind blocks scan per pattern, intersected client-side
+    # against the resolved names. The blocks API applies NO status filter, so
+    # skipping the intersect overcounts by an unbounded factor.
+    wanted_set = set(names)
+    blocks = _rows(client.listBlocks(dataset=pattern, detail=True))
+    calls += 1
+    for block in blocks:
+        owner = block.get("dataset")
+        if owner not in wanted_set:
+            continue
+        key = _group_of(owner, by_name[owner], group_by)
+        bucket = groups.setdefault(key, {"group": key, "n_datasets": 0, "datasets": []})
+        bucket["bytes"] = bucket.get("bytes", 0) + (block.get("block_size") or 0)
+        bucket["files"] = bucket.get("files", 0) + (block.get("file_count") or 0)
+        bucket["n_blocks"] = bucket.get("n_blocks", 0) + 1
+    coverage["n_summed"] = n_matched
+
+    events_total = None
+    events_reason = None
+    if "events" in wanted:
+        cap = _env_int("DBS_MAX_DATASETS_SUMMED", 60)
+        if n_matched > cap:
+            events_reason = (
+                f"{n_matched} datasets exceed the {cap}-dataset event cap; events need one "
+                "call per dataset. Narrow the pattern (for example per tier) to get them."
+            )
+        else:
+            events_total = 0
+            for name in names:
+                row = by_name[name]
+                kwargs: dict[str, Any] = {"dataset": name}
+                # validFileOnly is presence-checked and gates non-VALID datasets,
+                # so it is sent only where it is both meaningful and harmless.
+                if row.get("dataset_access_type") in VALID_SIDE_STATUSES and status != "*":
+                    kwargs["validFileOnly"] = 1
+                summary = _first_row(client.listFileSummaries(**kwargs))
+                calls += 1
+                events_total += summary.get("num_event") or 0
+                key = _group_of(name, row, group_by)
+                bucket = groups.setdefault(key, {"group": key, "n_datasets": 0, "datasets": []})
+                bucket["events"] = bucket.get("events", 0) + (summary.get("num_event") or 0)
+
+    out_groups = []
+    for g in sorted(groups.values(), key=lambda x: -x["n_datasets"]):
+        row = {"group": g["group"], "n_datasets": g["n_datasets"]}
+        for metric, field in (("bytes", "bytes"), ("files", "files"), ("blocks", "n_blocks")):
+            if metric in wanted:
+                row[field] = g.get(field, 0)
+        if "events" in wanted and events_total is not None:
+            row["events"] = g.get("events", 0)
+        out_groups.append(row)
+
+    totals: dict[str, Any] = {"n_datasets": n_matched}
+    if "bytes" in wanted:
+        totals["bytes"] = sum(g.get("bytes", 0) for g in groups.values())
+    if "files" in wanted:
+        totals["files"] = sum(g.get("files", 0) for g in groups.values())
+    if "blocks" in wanted:
+        totals["blocks"] = sum(g.get("n_blocks", 0) for g in groups.values())
+    if "events" in wanted:
+        totals["events"] = events_total
+        if events_reason:
+            totals["events_null_reason"] = events_reason
+
+    tiers_present = {_group_of(n, by_name[n], "tier") for n in names}
+    hint = "bytes and files come from block records; events need one call per dataset"
+    if "events" in wanted and len(tiers_present) > 1:
+        hint = ("events across more than one tier double-count the same physics events; "
+                "sum events within one tier only")
+    return _agg_envelope(out_groups, totals, coverage, pattern, status, calls, hint)
+
+
+def _agg_envelope(groups: list[dict[str, Any]], totals: dict[str, Any],
+                  coverage: dict[str, Any], pattern: str, status: str,
+                  calls: int, hint: str) -> dict[str, Any]:
+    base = _dbs_instance().rstrip("/")
+    return {
+        "groups": groups,
+        "totals": totals,
+        "coverage": coverage,
+        "provenance": {
+            "instance": _dbs_instance(),
+            "pattern": pattern,
+            "status_filter": status,
+            "queried_utc": _utc_now(),
+            "n_server_calls": calls,
+        },
+        "repro": [
+            f"dasgoclient --query 'dataset dataset={pattern} status={status}'",
+            f"curl -s '{base}/blocks?dataset={pattern}&detail=1' "
+            "--cert $X509_USER_PROXY --key $X509_USER_PROXY",
+        ],
+        "hint": hint,
+    }
+
+
 def main() -> None:
     mcp.run(
         transport="streamable-http",
