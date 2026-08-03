@@ -72,6 +72,11 @@ The server reads configuration from environment variables:
 - `DBS_RESULT_CAP_BYTES`: maximum serialized size of any tool result. Oversized
   lists are cut at a record boundary with a `truncated: showing X of N records`
   note. Defaults to `262144`.
+- `DBS_PROBE_BUDGET_S`: wall-clock seconds `dbs_aggregate` may spend probing
+  wider patterns after a pattern matches nothing. Set to `0` to switch probing
+  off. Defaults to `15`. A probe is only sent when some other path segment is
+  specific enough to anchor the search, because widening the only specific
+  part of a pattern asks DBS for the whole catalog.
 - `DBS_MAX_DATASETS_SUMMED`: how many datasets `dbs_aggregate` will sum events
   over (events cost one call per dataset). Above the cap events come back
   `null` with the reason. Defaults to `60`.

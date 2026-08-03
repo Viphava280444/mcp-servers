@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import os
+import time
 from functools import lru_cache
 from typing import Any
 from dbs.apis.dbsClient import DbsApi
@@ -446,31 +447,56 @@ def _relaxed_patterns(pattern: str) -> list[str]:
     /HIForward/Era-v1/AOD -> /HIForward*/Era-v1/AOD, /HIForward/Era-v1*/AOD,
     /HIForward/Era-v1/AOD*. Segments that already carry a wildcard are left
     alone, so a fully wildcarded pattern produces no probes at all.
+
+    A segment is widened ONLY if some other segment is still specific. That
+    other segment is the anchor DBS searches on. Without one, widening asks
+    for the whole catalog: /*/*/NANOAO -> /*/*/NANOAO* measured at 277 s,
+    well past the 120 s at which the caller kills the tool. A probe that
+    costs more than the query it rescues is not help.
     """
     parts = pattern.strip("/").split("/")
     if len(parts) != 3:
         return []
+    specific = [i for i, part in enumerate(parts) if part and "*" not in part]
+    if len(specific) < 2:
+        return []
     out = []
-    for i, part in enumerate(parts):
-        if not part or "*" in part:
-            continue
+    for i in specific:
         widened = list(parts)
-        widened[i] = part + "*"
+        widened[i] = parts[i] + "*"
         out.append("/" + "/".join(widened))
     return out
 
 
+def _probe_budget_s() -> float:
+    try:
+        return float(os.environ.get("DBS_PROBE_BUDGET_S", "15"))
+    except ValueError:
+        return 15.0
+
+
 def _probe_wider_patterns(client: Any, pattern: str,
-                          status: str) -> tuple[list[dict[str, Any]], int]:
-    """Which wider patterns actually hold data? Returns (suggestions, calls).
+                          status: str) -> tuple[list[dict[str, Any]], int, bool]:
+    """Which wider patterns actually hold data?
+
+    Returns (suggestions, calls_made, ran_out_of_time).
 
     A zero result is the one answer a model cannot check, so it invents a
     reason instead. Handing back a pattern that DOES match turns a dead end
-    into a next step. Bounded: at most one probe per path segment.
+    into a next step. Bounded twice: at most one probe per specific segment,
+    and a wall-clock budget checked between probes so a slow server costs one
+    probe instead of three.
     """
+    budget = _probe_budget_s()
+    if budget <= 0:
+        return [], 0, False
+
     found: list[dict[str, Any]] = []
     calls = 0
+    started = time.monotonic()
     for candidate in _relaxed_patterns(pattern):
+        if calls and time.monotonic() - started >= budget:
+            return found, calls, True
         calls += 1
         try:
             rows = _rows(client.listDatasets(dataset=candidate,
@@ -481,7 +507,7 @@ def _probe_wider_patterns(client: Any, pattern: str,
         if names:
             found.append({"pattern": candidate, "n_datasets": len(names),
                           "example": sorted(names)[0]})
-    return found, calls
+    return found, calls, False
 
 
 @mcp.tool()
@@ -728,10 +754,13 @@ def dbs_aggregate(
         totals = {"n_datasets": n_matched}
         suggestions: list[dict[str, Any]] = []
         if n_matched == 0:
-            suggestions, probe_calls = _probe_wider_patterns(client, pattern, status)
+            suggestions, probe_calls, timed_out = _probe_wider_patterns(
+                client, pattern, status)
             calls += probe_calls
             hint = (f"no datasets match this pattern at status {status}; "
                     "check the name or widen the status")
+            if timed_out and not suggestions:
+                hint += " (gave up probing wider names: time budget spent)"
             if suggestions:
                 best = max(suggestions, key=lambda s: s["n_datasets"])
                 hint = (f"no datasets match {pattern} at status {status}, but "
