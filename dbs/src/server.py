@@ -344,6 +344,228 @@ def _bounded(result: Any) -> Any:
     )
 
 
+# ---------------------------------------------------------------------------
+# Task tools. These do the DBS-specific reasoning once, in code, instead of
+# leaving each conversation to rediscover the server's traps.
+# ---------------------------------------------------------------------------
+
+# validFileOnly is PRESENCE-checked by the server: sending 0 behaves like 1, so
+# the all-files call must omit the key. The flag also silently restricts to
+# datasets whose access type is VALID or PRODUCTION.
+VALID_SIDE_STATUSES = frozenset({"VALID", "PRODUCTION"})
+RUCIO_NOTE = (
+    "origin_site is bookkeeping history (where blocks were produced or injected), "
+    "not current location; ask Rucio for replicas."
+)
+
+
+def _utc_now() -> str:
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _epoch_to_day(value: Any) -> str | None:
+    from datetime import datetime, timezone
+
+    try:
+        return datetime.fromtimestamp(int(value), tz=timezone.utc).strftime("%Y-%m-%d")
+    except (TypeError, ValueError, OSError):
+        return None
+
+
+def _first_row(rows: Any) -> dict[str, Any]:
+    if isinstance(rows, list) and rows and isinstance(rows[0], dict):
+        return rows[0]
+    return {}
+
+
+def _rows(value: Any) -> list[dict[str, Any]]:
+    return [row for row in value if isinstance(row, dict)] if isinstance(value, list) else []
+
+
+def _dbs_instance() -> str:
+    return os.getenv("DBS_URL", DEFAULT_DBS_URL)
+
+
+def _repro_lines(subject: str, kind: str) -> list[str]:
+    base = _dbs_instance().rstrip("/")
+    if kind == "block":
+        quoted = subject.replace("#", "%23")
+        return [
+            f"dasgoclient --query 'summary block={subject}'",
+            f"curl -s '{base}/blocksummaries?block_name={quoted}' --cert $X509_USER_PROXY --key $X509_USER_PROXY",
+        ]
+    return [
+        f"dasgoclient --query 'summary dataset={subject}'",
+        f"curl -s '{base}/filesummaries?dataset={subject}' --cert $X509_USER_PROXY --key $X509_USER_PROXY",
+    ]
+
+
+def _did_you_mean(client: Any, dataset: str, limit: int = 10) -> list[str]:
+    """One bounded probe: keep the primary dataset name, widen the rest."""
+    parts = dataset.strip("/").split("/")
+    if len(parts) != 3:
+        return []
+    pattern = f"/{parts[0]}/*/{parts[2]}"
+    try:
+        rows = client.listDatasets(dataset=pattern, dataset_access_type="*")
+    except Exception:
+        return []
+    return [row.get("dataset") for row in _rows(rows) if row.get("dataset")][:limit]
+
+
+@mcp.tool()
+def dbs_summary(subject: str) -> dict[str, Any]:
+    """Full picture of ONE dataset or block: status, size, events, files
+    (valid and invalid sides), lumis, blocks and open blocks, activity dates,
+    run range and origin sites, with provenance and reproduction commands.
+
+    `subject` is an exact dataset path (/primary/processed/TIER) or a block
+    name (a path with a #hash). Use this instead of stitching together
+    listDatasets, listFileSummaries and listBlocks by hand. For totals over
+    MANY datasets use dbs_aggregate.
+    """
+    client = _dbs_client()
+    calls = 0
+    is_block = "#" in subject
+
+    if is_block:
+        summaries = client.listBlockSummaries(block_name=subject)
+        calls += 1
+        blocks = _rows(client.listBlocks(block_name=subject, detail=True))
+        calls += 1
+        row = _first_row(summaries)
+        block_row = blocks[0] if blocks else {}
+        created = [b.get("creation_date") for b in blocks if b.get("creation_date")]
+        summary: dict[str, Any] = {
+            "subject": subject,
+            "subject_kind": "block",
+            "found": bool(summaries or blocks),
+            "dataset": block_row.get("dataset"),
+            "bytes_all_files": row.get("file_size"),
+            "events_all_files": row.get("num_event"),
+            "n_files_all": row.get("num_file"),
+            "n_blocks": len(blocks),
+            "n_open_blocks": sum(1 for b in blocks if b.get("open_for_writing")),
+            "origin_sites": _site_counts(blocks),
+            "oldest_block_created": _epoch_to_day(min(created)) if created else None,
+            "newest_block_created": _epoch_to_day(max(created)) if created else None,
+        }
+        return _envelope(summary, subject, "block", calls, status_filter="n/a")
+
+    # Dataset subject. Existence first, with '*' so an invalidated dataset is
+    # never mistaken for a missing one (DBS answers 200 + empty list for both).
+    found_rows = _rows(client.listDatasets(dataset=subject, dataset_access_type="*", detail=True))
+    calls += 1
+    if not found_rows:
+        summary = {
+            "subject": subject,
+            "subject_kind": "dataset",
+            "found": False,
+            "did_you_mean": _did_you_mean(client, subject),
+        }
+        calls += 1
+        return _envelope(summary, subject, "dataset", calls)
+
+    meta = found_rows[0]
+    status = meta.get("dataset_access_type")
+    all_row = _first_row(client.listFileSummaries(dataset=subject))
+    calls += 1
+
+    valid_row: dict[str, Any] = {}
+    valid_reason = None
+    if status in VALID_SIDE_STATUSES:
+        valid_row = _first_row(client.listFileSummaries(dataset=subject, validFileOnly=1))
+        calls += 1
+    else:
+        valid_reason = "gated_by_access_type"
+
+    blocks = _rows(client.listBlocks(dataset=subject, detail=True))
+    calls += 1
+    runs = sorted({r.get("run_num") for r in _rows(client.listRuns(dataset=subject))
+                   if r.get("run_num") is not None})
+    calls += 1
+    created = [b.get("creation_date") for b in blocks if b.get("creation_date")]
+
+    n_all = all_row.get("num_file")
+    n_valid = valid_row.get("num_file") if valid_row else None
+    summary = {
+        "subject": subject,
+        "subject_kind": "dataset",
+        "found": True,
+        "status": status,
+        "tier": meta.get("data_tier_name") or subject.rstrip("/").split("/")[-1],
+        "bytes_all_files": all_row.get("file_size"),
+        "bytes_valid_files": valid_row.get("file_size") if valid_row else None,
+        "events_all_files": all_row.get("num_event"),
+        "events_valid_files": valid_row.get("num_event") if valid_row else None,
+        "n_files_all": n_all,
+        "n_files_valid": n_valid,
+        "n_files_invalid": (n_all - n_valid) if (n_all is not None and n_valid is not None) else None,
+        "n_lumis": all_row.get("num_lumi"),
+        "n_blocks": len(blocks),
+        "n_open_blocks": sum(1 for b in blocks if b.get("open_for_writing")),
+        "oldest_block_created": _epoch_to_day(min(created)) if created else None,
+        "newest_block_created": _epoch_to_day(max(created)) if created else None,
+        "n_runs": len(runs),
+        "run_min": runs[0] if runs else None,
+        "run_max": runs[-1] if runs else None,
+        "runs_basis": "all_files",
+        "origin_sites": _site_counts(blocks),
+    }
+    if valid_reason:
+        summary["valid_side_null_reason"] = valid_reason
+    if status and status != "VALID":
+        summary["invalidated_on"] = _epoch_to_day(meta.get("last_modification_date"))
+        summary["invalidated_by"] = meta.get("last_modified_by")
+
+    diagnosis = _diagnose_zero_row(all_row, wildcard_sent="*" in subject,
+                                   status=status, flag_sent=False)
+    if diagnosis:
+        summary["zero_row_diagnosis"] = diagnosis
+    return _envelope(summary, subject, "dataset", calls)
+
+
+def _site_counts(blocks: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for block in blocks:
+        site = block.get("origin_site_name")
+        if site:
+            counts[site] = counts.get(site, 0) + 1
+    return counts
+
+
+def _diagnose_zero_row(row: dict[str, Any], *, wildcard_sent: bool,
+                       status: str | None, flag_sent: bool) -> str | None:
+    """An all-zero summary row is usually a trap, not data. num_block tells which."""
+    if not row or any(row.get(k) for k in ("file_size", "num_file", "num_event")):
+        return None
+    if row.get("num_block"):
+        return ("zeros with a non-zero block count: the validFileOnly gate gated this "
+                "dataset (its access type is outside VALID/PRODUCTION)")
+    if wildcard_sent:
+        return ("zeros with no blocks: a wildcard reached a summaries API, which returns "
+                "an all-zero row instead of an error; query one exact dataset")
+    return "zeros with no blocks: nothing matched this exact path"
+
+
+def _envelope(summary: dict[str, Any], subject: str, kind: str, calls: int,
+              status_filter: str = "*") -> dict[str, Any]:
+    return {
+        "summary": summary,
+        "provenance": {
+            "instance": _dbs_instance(),
+            "status_filter": status_filter,
+            "validity_basis": "both_sides_reported",
+            "queried_utc": _utc_now(),
+            "n_server_calls": calls,
+        },
+        "repro": _repro_lines(subject, kind),
+        "note": RUCIO_NOTE,
+    }
+
+
 def main() -> None:
     mcp.run(
         transport="streamable-http",
