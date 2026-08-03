@@ -67,18 +67,10 @@ def test_none_kwargs_are_dropped_but_detail_false_is_sent(patched_server, stub):
     assert kwargs["detail"] is False
 
 
-# --- characterization: pins the CURRENT holes; commit 2 flips these on purpose
+# --- the read-only lock and empty-result honesty live in test_micro_fixes.py
 
 
-def test_current_method_discovery_exposes_write_methods(patched_server, stub):
+def test_read_methods_are_discoverable(patched_server, stub):
     methods = patched_server._public_methods()
-    for name in WRITE_METHODS:
-        assert name in methods, "characterization: the write hole is open today"
     for name in READ_METHODS:
         assert name in methods
-
-
-def test_current_empty_result_is_a_bare_empty_list(patched_server, stub):
-    stub.add("listDatasets", [])
-    result = patched_server.dbs_list_datasets(dataset="/No/Match/RAW")
-    assert result == []  # characterization: silent empty today

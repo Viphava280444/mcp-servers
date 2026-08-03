@@ -12,11 +12,40 @@ from mcp.server.fastmcp import FastMCP
 
 
 DEFAULT_DBS_URL = "https://cmsweb.cern.ch/dbs/prod/global/DBSReader/"
-WRITE_METHOD_PREFIXES = ("insert", "submit", "remove")
-BLOCKED_METHODS = {
-    "requestTimingInfo",
-    "requestContentLength",
-}
+# This server is read-only: only these DbsApi methods are reachable, checked
+# before any HTTP. (The old write-prefix filter was never applied anywhere.)
+READ_METHOD_ALLOWLIST = frozenset(
+    {
+        "serverinfo",
+        "help",
+        "blockDump",
+        "listDatasets",
+        "listFiles",
+        "listBlocks",
+        "listRuns",
+        "listRunSummaries",
+        "listFileSummaries",
+        "listBlockSummaries",
+        "listFileLumis",
+        "listDatasetParents",
+        "listDatasetChildren",
+        "listBlockParents",
+        "listBlockChildren",
+        "listFileParents",
+        "listFileChildren",
+        "listBlockOrigin",
+        "listAcquisitionEras",
+        "listProcessingEras",
+        "listDataTiers",
+        "listDataTypes",
+        "listPhysicsGroups",
+        "listDatasetAccessTypes",
+        "listPrimaryDatasets",
+        "listPrimaryDSTypes",
+        "listReleaseVersions",
+        "listOutputConfigs",
+    }
+)
 
 host = os.getenv("MCP_HOST", "0.0.0.0")
 port = int(os.getenv("MCP_PORT", "8013"))
@@ -64,7 +93,7 @@ def _public_methods() -> dict[str, Any]:
     client = _dbs_client()
     methods: dict[str, Any] = {}
     for name in dir(client):
-        if name.startswith("_") or name in BLOCKED_METHODS:
+        if name.startswith("_") or name not in READ_METHOD_ALLOWLIST:
             continue
         attr = getattr(client, name)
         if callable(attr):
@@ -78,7 +107,10 @@ def _get_method(name: str) -> Any:
         return methods[name]
     except KeyError as exc:
         available = ", ".join(sorted(methods))
-        raise ValueError(f"Unsupported DBS method {name!r}. Available methods: {available}") from exc
+        raise ValueError(
+            f"DBS method {name!r} is not available: this server is read-only. "
+            f"Allowed methods: {available}"
+        ) from exc
 
 
 def _call_dbs_method(method_name: str, kwargs: dict[str, Any] | None = None, payload: Any = None) -> Any:
@@ -145,15 +177,15 @@ def dbs_method_help(method: str) -> dict[str, str]:
 
 @mcp.tool()
 def dbs_call(method: str, kwargs: dict[str, Any] | None = None, payload: Any = None) -> Any:
-    """Call any public method on dbs.apis.dbsClient.DbsApi.
+    """Call a READ method on dbs.apis.dbsClient.DbsApi (write methods are blocked).
 
-    Use `kwargs` for parameter-style DBS methods such as `listDatasets` or
-    `updateFileStatus`. Use `payload` for object-style methods such as
-    `insertDataset`, `insertBulkBlock`, `submitMigration`, and
-    `removeMigration`.
+    Use `kwargs` for parameter-style DBS read methods such as `listDatasets`
+    or `listFileSummaries`. Prefer the task tools when one fits: totals and
+    per-group sums -> dbs_aggregate; one dataset or block's full picture ->
+    dbs_summary.
     """
-    try: 
-        return _call_dbs_method(method, kwargs=kwargs, payload=payload)
+    try:
+        return _bounded(_call_dbs_method(method, kwargs=kwargs, payload=payload))
     except Exception:
         import traceback
         traceback.print_exc()
@@ -182,7 +214,13 @@ def dbs_list_datasets(
             "detail": detail,
         }
     )
-    return _dbs_client().listDatasets(**kwargs)
+    result = _bounded(_dbs_client().listDatasets(**kwargs))
+    if dataset_access_type is None:
+        if isinstance(result, str):
+            result = f"{result}. {VALID_DEFAULT_NOTE}"
+        elif isinstance(result, list):
+            result = result + [VALID_DEFAULT_NOTE]
+    return result
 
 
 @mcp.tool()
@@ -205,7 +243,7 @@ def dbs_list_files(
             "validFileOnly": validFileOnly,
         }
     )
-    return _dbs_client().listFiles(**kwargs)
+    return _bounded(_dbs_client().listFiles(**kwargs))
 
 
 @mcp.tool()
@@ -228,7 +266,7 @@ def dbs_list_blocks(
             "detail": detail,
         }
     )
-    return _dbs_client().listBlocks(**kwargs)
+    return _bounded(_dbs_client().listBlocks(**kwargs))
 
 
 @mcp.tool()
@@ -247,17 +285,63 @@ def dbs_list_runs(
             "run_num": run_num,
         }
     )
-    return _dbs_client().listRuns(**kwargs)
+    return _bounded(_dbs_client().listRuns(**kwargs))
 
 
 @mcp.tool()
 def dbs_block_dump(block_name: str) -> Any:
     """Return all DBS information related to a block."""
-    return _dbs_client().blockDump(block_name=block_name)
+    return _bounded(_dbs_client().blockDump(block_name=block_name))
 
 
 def _drop_none(values: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in values.items() if value is not None}
+
+
+VALID_DEFAULT_NOTE = (
+    "note: VALID datasets only (server default); "
+    "pass dataset_access_type='*' for all statuses"
+)
+
+
+def _bounded(result: Any) -> Any:
+    """Empty results say so; oversized results are cut with an honest note."""
+    import json
+
+    if isinstance(result, list) and not result:
+        return "0 rows matched"
+    cap = _env_int("DBS_RESULT_CAP_BYTES", 262144)
+    if isinstance(result, list):
+        try:
+            size = len(json.dumps(result, default=str))
+        except (TypeError, ValueError):
+            return result
+        if size <= cap:
+            return result
+        total = len(result)
+        kept: list[Any] = []
+        used = 2
+        for row in result:
+            row_size = len(json.dumps(row, default=str)) + 2
+            if used + row_size > cap:
+                break
+            kept.append(row)
+            used += row_size
+        kept.append(
+            f"truncated: showing {len(kept)} of {total} records; "
+            "narrow the query for the rest"
+        )
+        return kept
+    try:
+        size = len(json.dumps(result, default=str))
+    except (TypeError, ValueError):
+        return result
+    if size <= cap:
+        return result
+    return (
+        f"truncated: the full object is {size} bytes, above the "
+        f"{cap}-byte result cap; use a narrower tool or query"
+    )
 
 
 def main() -> None:
