@@ -151,8 +151,10 @@ def _call_dbs_method(method_name: str, kwargs: dict[str, Any] | None = None, pay
 
 @mcp.tool()
 def dbs_server_info() -> Any:
-    """Return metadata from the configured DBS server."""
-    return _dbs_client().serverinfo()
+    """Return the configured DBS server's version and instance URL."""
+    info = _dbs_client().serverinfo()
+    rows = info if isinstance(info, list) else [info]
+    return [dict(r, instance=_dbs_instance()) if isinstance(r, dict) else r for r in rows]
 
 
 @mcp.tool()
@@ -202,7 +204,12 @@ def dbs_list_datasets(
     run_num: int | str | list[Any] | None = None,
     detail: bool = False,
 ) -> Any:
-    """List DBS datasets with common filters."""
+    """List DBS dataset NAMES matching filters.
+
+    Pass dataset_access_type explicitly ('*' for every status): the server
+    silently shows VALID only when it is omitted. For counts or totals use
+    dbs_aggregate instead of listing and counting here.
+    """
     kwargs = _drop_none(
         {
             "dataset": dataset,
@@ -232,7 +239,12 @@ def dbs_list_files(
     detail: bool = False,
     validFileOnly: int | None = None,
 ) -> Any:
-    """List DBS files with common filters."""
+    """List DBS files matching filters.
+
+    Narrow with run_num, block_name or logical_file_name; an unfiltered
+    dataset listing can return hundreds of thousands of records. For a
+    dataset's file COUNT use dbs_summary.
+    """
     kwargs = _drop_none(
         {
             "dataset": dataset,
@@ -255,7 +267,12 @@ def dbs_list_blocks(
     run_num: int | str | list[Any] | None = None,
     detail: bool = False,
 ) -> Any:
-    """List DBS blocks with common filters."""
+    """List DBS blocks matching filters.
+
+    run_num works here (it does not on the summary endpoints). Note the
+    server ignores open_for_writing as a filter and applies no dataset
+    status filter. For block counts and sizes use dbs_summary.
+    """
     kwargs = _drop_none(
         {
             "dataset": dataset,
@@ -276,7 +293,11 @@ def dbs_list_runs(
     logical_file_name: str | None = None,
     run_num: int | str | list[Any] | None = None,
 ) -> Any:
-    """List run numbers for a dataset, block, file, or explicit run filter."""
+    """List run numbers for a dataset, block, file, or explicit run filter.
+
+    Returns raw run numbers, unsorted, on an all-files basis. For a run
+    range plus counts use dbs_summary.
+    """
     kwargs = _drop_none(
         {
             "dataset": dataset,
@@ -290,7 +311,11 @@ def dbs_list_runs(
 
 @mcp.tool()
 def dbs_block_dump(block_name: str) -> Any:
-    """Return all DBS information related to a block."""
+    """Return all DBS information related to a block (large).
+
+    For a block's size, files, events, open flag and origin site, prefer
+    dbs_summary with the block name as subject.
+    """
     return _bounded(_dbs_client().blockDump(block_name=block_name))
 
 
