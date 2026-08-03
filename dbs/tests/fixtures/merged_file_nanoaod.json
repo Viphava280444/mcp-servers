@@ -1,0 +1,16 @@
+{
+  "_note": "Models the measured merged-file trap: filesummaries with run_num counts WHOLE files, so two runs sharing one file each report the full file's events (1,059,120 measured live on MuonEG NanoAODv9). filelumis carries the true per-run split; here the split sums exactly to the file total.",
+  "dataset": "/MuonEG/TestRun2018A-NanoAODv9-v1/NANOAOD",
+  "file": "/store/data/testfile-E037F4CD.root",
+  "filesummaries_per_run": [
+    [{"run_num": 315257}, [{"file_size": 39956761725, "num_file": 1, "num_event": 1059120, "num_lumi": 210, "num_block": 1}]],
+    [{"run_num": 315258}, [{"file_size": 39956761725, "num_file": 1, "num_event": 1059120, "num_lumi": 210, "num_block": 1}]]
+  ],
+  "filelumis": [
+    {"logical_file_name": "/store/data/testfile-E037F4CD.root", "run_num": 315257, "lumi_section_num": [1, 2, 3], "event_count": [200000, 200000, 130000]},
+    {"logical_file_name": "/store/data/testfile-E037F4CD.root", "run_num": 315258, "lumi_section_num": [4, 5], "event_count": [300000, 229120]}
+  ],
+  "true_events_315257": 530000,
+  "true_events_315258": 529120,
+  "whole_file_events": 1059120
+}

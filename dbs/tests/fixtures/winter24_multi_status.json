@@ -1,0 +1,28 @@
+{
+  "_note": "Scaled-down model of the measured Winter24 trap: the blocks API ignores dataset_access_type, so an unfiltered block sum overcounts massively (9.04x measured live). Numbers here are synthetic but shaped like the real campaign: INVALID datasets dominate the unfiltered sum. The VALID intersect must change the answer.",
+  "pattern": "/*/TestWinter24*/GEN-SIM-RAW",
+  "datasets_all_status": [
+    {"dataset": "/SampleA/TestWinter24-v1/GEN-SIM-RAW", "dataset_access_type": "VALID"},
+    {"dataset": "/SampleB/TestWinter24-v1/GEN-SIM-RAW", "dataset_access_type": "VALID"},
+    {"dataset": "/SampleC/TestWinter24-v1/GEN-SIM-RAW", "dataset_access_type": "VALID"},
+    {"dataset": "/SampleD/TestWinter24-v1/GEN-SIM-RAW", "dataset_access_type": "INVALID"},
+    {"dataset": "/SampleE/TestWinter24-v1/GEN-SIM-RAW", "dataset_access_type": "INVALID"},
+    {"dataset": "/SampleF/TestWinter24-v1/GEN-SIM-RAW", "dataset_access_type": "PRODUCTION"}
+  ],
+  "datasets_valid_names": [
+    "/SampleA/TestWinter24-v1/GEN-SIM-RAW",
+    "/SampleB/TestWinter24-v1/GEN-SIM-RAW",
+    "/SampleC/TestWinter24-v1/GEN-SIM-RAW"
+  ],
+  "blocks_detail_all": [
+    {"dataset": "/SampleA/TestWinter24-v1/GEN-SIM-RAW", "block_name": "/SampleA/TestWinter24-v1/GEN-SIM-RAW#b1", "block_size": 1000, "file_count": 10, "open_for_writing": 0, "origin_site_name": "T1_US_FNAL_Disk", "creation_date": 1706000000},
+    {"dataset": "/SampleB/TestWinter24-v1/GEN-SIM-RAW", "block_name": "/SampleB/TestWinter24-v1/GEN-SIM-RAW#b1", "block_size": 2000, "file_count": 20, "open_for_writing": 0, "origin_site_name": "T1_US_FNAL_Disk", "creation_date": 1706100000},
+    {"dataset": "/SampleC/TestWinter24-v1/GEN-SIM-RAW", "block_name": "/SampleC/TestWinter24-v1/GEN-SIM-RAW#b1", "block_size": 3000, "file_count": 30, "open_for_writing": 0, "origin_site_name": "T2_CH_CERN", "creation_date": 1706200000},
+    {"dataset": "/SampleD/TestWinter24-v1/GEN-SIM-RAW", "block_name": "/SampleD/TestWinter24-v1/GEN-SIM-RAW#b1", "block_size": 40000, "file_count": 400, "open_for_writing": 0, "origin_site_name": "T1_US_FNAL_Disk", "creation_date": 1706300000},
+    {"dataset": "/SampleE/TestWinter24-v1/GEN-SIM-RAW", "block_name": "/SampleE/TestWinter24-v1/GEN-SIM-RAW#b1", "block_size": 5000, "file_count": 50, "open_for_writing": 0, "origin_site_name": "T2_DE_DESY", "creation_date": 1706400000},
+    {"dataset": "/SampleF/TestWinter24-v1/GEN-SIM-RAW", "block_name": "/SampleF/TestWinter24-v1/GEN-SIM-RAW#b1", "block_size": 600, "file_count": 6, "open_for_writing": 1, "origin_site_name": "T2_DE_DESY", "creation_date": 1706500000}
+  ],
+  "expected_valid_bytes": 6000,
+  "expected_valid_files": 60,
+  "expected_unfiltered_bytes": 51600
+}

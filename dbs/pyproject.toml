@@ -14,8 +14,18 @@ dependencies = [
   "dbs3-client>=4.0.19",
 ]
 
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
 [project.scripts]
 dbs-mcp = "src.server:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+  "integration: needs live DBS and grid credentials; excluded by default runs",
+]
+addopts = "-m 'not integration'"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src"]

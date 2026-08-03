@@ -1,0 +1,11 @@
+{
+  "_note": "Measured server behavior for a well-formed path that does not exist: datasets returns HTTP 200 with an empty list even with dataset_access_type='*', filesummaries returns HTTP 200 with one all-zero row whose num_block is 0 (the wildcard/no-match fingerprint). Never a 404.",
+  "dataset": "/DoesNotExist/NoSuchEra-v1/RAW",
+  "datasets_star": [],
+  "filesummaries": [
+    {"file_size": 0, "num_file": 0, "num_event": 0, "num_lumi": 0, "num_block": 0}
+  ],
+  "did_you_mean_probe": [
+    {"dataset": "/DoesExist/RealEra-v1/RAW"}
+  ]
+}
