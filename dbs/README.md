@@ -19,7 +19,11 @@ Task tools (prefer these):
 - `dbs_aggregate`: totals and per-group sums over MANY datasets matching a
   pattern (group by tier, stream, version or status; `count_only` for a pure
   count). Output size follows the number of groups, not the number of
-  datasets, so a whole-era question stays small.
+  datasets, so a whole-era question stays small. Dataset, byte, file and block
+  counts always come back together — one block scan pays for all four — while
+  `events` is opt-in because it costs one call per dataset. An unknown metric
+  name is rejected, never ignored. When the pattern matches nothing, the reply
+  carries `did_you_mean`: wider patterns that do hold data.
 
 Thin wrappers (use when you want raw rows):
 

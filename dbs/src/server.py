@@ -440,6 +440,50 @@ def _did_you_mean(client: Any, dataset: str, limit: int = 10) -> list[str]:
     return [row.get("dataset") for row in _rows(rows) if row.get("dataset")][:limit]
 
 
+def _relaxed_patterns(pattern: str) -> list[str]:
+    """Widen one path segment at a time by appending a wildcard.
+
+    /HIForward/Era-v1/AOD -> /HIForward*/Era-v1/AOD, /HIForward/Era-v1*/AOD,
+    /HIForward/Era-v1/AOD*. Segments that already carry a wildcard are left
+    alone, so a fully wildcarded pattern produces no probes at all.
+    """
+    parts = pattern.strip("/").split("/")
+    if len(parts) != 3:
+        return []
+    out = []
+    for i, part in enumerate(parts):
+        if not part or "*" in part:
+            continue
+        widened = list(parts)
+        widened[i] = part + "*"
+        out.append("/" + "/".join(widened))
+    return out
+
+
+def _probe_wider_patterns(client: Any, pattern: str,
+                          status: str) -> tuple[list[dict[str, Any]], int]:
+    """Which wider patterns actually hold data? Returns (suggestions, calls).
+
+    A zero result is the one answer a model cannot check, so it invents a
+    reason instead. Handing back a pattern that DOES match turns a dead end
+    into a next step. Bounded: at most one probe per path segment.
+    """
+    found: list[dict[str, Any]] = []
+    calls = 0
+    for candidate in _relaxed_patterns(pattern):
+        calls += 1
+        try:
+            rows = _rows(client.listDatasets(dataset=candidate,
+                                             dataset_access_type=status))
+        except Exception:
+            continue
+        names = [r.get("dataset") for r in rows if r.get("dataset")]
+        if names:
+            found.append({"pattern": candidate, "n_datasets": len(names),
+                          "example": sorted(names)[0]})
+    return found, calls
+
+
 @mcp.tool()
 def dbs_summary(subject: str) -> dict[str, Any]:
     """Full picture of ONE dataset or block: status, size, events, files
@@ -593,6 +637,7 @@ def _envelope(summary: dict[str, Any], subject: str, kind: str, calls: int,
 
 GROUP_KEYS = ("auto", "none", "tier", "stream", "version", "status")
 DEFAULT_METRICS = ("count", "bytes", "files", "blocks")
+VALID_METRICS = ("count", "bytes", "files", "blocks", "events")
 
 
 def _group_of(dataset: str, row: dict[str, Any], key: str) -> str:
@@ -623,8 +668,15 @@ def dbs_aggregate(
     many datasets match this pattern". `pattern` is a dataset wildcard such as
     /*/HIRun2026A*/AOD. `status` must be explicit ('VALID', 'INVALID', '*',
     ...) because the DBS default silently hides everything that is not VALID.
-    `group_by` is auto|none|tier|stream|version|status. `metrics` is any of
-    count, bytes, files, blocks, events. Set `count_only` for a pure count.
+    `group_by` is auto|none|tier|stream|version|status. Dataset, byte, file
+    and block counts always come back together, because one block scan pays
+    for all four; add "events" to `metrics` to also pay one call per dataset
+    for event counts. An unknown metric name is an error, never ignored. Set
+    `count_only` for a pure count with no block scan at all.
+
+    If the pattern matches nothing, the reply carries `did_you_mean`: wider
+    patterns that DO hold data. Re-run with one of those instead of reporting
+    zero.
 
     The reply's size follows the number of GROUPS, never the number of
     datasets, so it is safe on a whole era. Eras are selected by name pattern:
@@ -633,7 +685,20 @@ def dbs_aggregate(
     """
     if group_by not in GROUP_KEYS:
         raise ValueError(f"group_by must be one of {', '.join(GROUP_KEYS)}")
-    wanted = [m for m in (metrics or list(DEFAULT_METRICS))]
+    unknown = [m for m in (metrics or ()) if m not in VALID_METRICS]
+    if unknown:
+        # Accepting a metric and ignoring it is exactly the DBS behavior this
+        # server exists to stop. Fail loudly, before spending a call.
+        raise ValueError(
+            f"unknown metric(s): {', '.join(unknown)}. "
+            f"Valid metrics are {', '.join(VALID_METRICS)}."
+        )
+    # count, bytes, files and blocks all fall out of the same single block
+    # scan, so they are always returned; `metrics` only decides whether to pay
+    # the per-dataset cost of events.
+    wanted = list(DEFAULT_METRICS)
+    if "events" in (metrics or ()):
+        wanted.append("events")
     client = _dbs_client()
     calls = 0
 
@@ -661,10 +726,25 @@ def dbs_aggregate(
         out_groups = [{"group": g["group"], "n_datasets": g["n_datasets"]}
                       for g in groups.values()]
         totals = {"n_datasets": n_matched}
-        hint = ("no datasets match this pattern at status "
-                f"{status}; check the name or widen the status") if n_matched == 0 else \
-               "counts come from dataset names; ask for bytes to pay for the block scan"
-        return _agg_envelope(out_groups, totals, coverage, pattern, status, calls, hint)
+        suggestions: list[dict[str, Any]] = []
+        if n_matched == 0:
+            suggestions, probe_calls = _probe_wider_patterns(client, pattern, status)
+            calls += probe_calls
+            hint = (f"no datasets match this pattern at status {status}; "
+                    "check the name or widen the status")
+            if suggestions:
+                best = max(suggestions, key=lambda s: s["n_datasets"])
+                hint = (f"no datasets match {pattern} at status {status}, but "
+                        f"{best['pattern']} matches {best['n_datasets']}. "
+                        "Re-run with that pattern; do NOT report zero.")
+        else:
+            hint = ("counts come from dataset names; ask for bytes to pay for "
+                    "the block scan")
+        envelope = _agg_envelope(out_groups, totals, coverage, pattern, status,
+                                 calls, hint)
+        if n_matched == 0:
+            envelope["did_you_mean"] = suggestions
+        return envelope
 
     # Sizes: one status-blind blocks scan per pattern, intersected client-side
     # against the resolved names. The blocks API applies NO status filter, so

@@ -62,11 +62,36 @@ system could also add them up.
 7. **Nothing returns 404.** A typo, a missing dataset and a status-hidden
    dataset all come back as an empty result. Only a query with status `*`
    tells them apart.
+8. **A name can be too narrow by one character.** `/HIForward/...` matches
+   nothing because the datasets are `HIForward0` … `HIForward29`. Widening the
+   status will not save you; widen the NAME. `dbs_aggregate` does this probe
+   for you and returns `did_you_mean` with patterns that really hold data.
+
+## Zero is almost never the answer
+
+An empty result means "this query found nothing", not "this data does not
+exist". Before you report a zero:
+
+- Read `did_you_mean`. If it offers a pattern, re-run with it. Never report
+  zero while a suggestion is sitting in the reply.
+- Try status `*`. VALID is a silent default and hides the rest.
+- Check the name shape: primary, processed, tier, and a wildcard on any part
+  that may carry a number or suffix.
+
+Only after those say nothing may you answer "no such data", and then say which
+query you ran.
 
 ## Answer discipline
 
 - State the instance, the status filter and the validity basis with any
-  number. The task tools return these in `provenance`; quote them.
+  number. The task tools return these in `provenance`; quote them. Do not
+  call `dbs_server_info` just to learn the instance — it is already in
+  `provenance`.
+- **Report every number the tool handed you.** `dbs_aggregate` returns the
+  dataset, byte, file and block counts together, per group and in the total,
+  because one scan paid for all four. A "how big is it" answer that gives
+  bytes but drops the dataset count is an incomplete answer. The same holds
+  for `dbs_summary`: give the whole picture, not the single field asked about.
 - Give bytes as exact bytes **and** in human units (1 TB = 1e12 bytes).
 - Never round a count. Either give the exact number or say why it is not
   available and how to narrow the question.
