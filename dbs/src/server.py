@@ -814,11 +814,13 @@ def dbs_aggregate(
     many datasets match this pattern". `pattern` is a dataset wildcard such as
     /*/HIRun2026A*/AOD. `status` must be explicit ('VALID', 'INVALID', '*',
     ...) because the DBS default silently hides everything that is not VALID.
-    Explicit is not the same as widest: use 'VALID' for how-big and what-does-
-    it-contain questions, and '*' only when the question is about existence or
-    about other statuses. Non-valid datasets are failed and superseded
-    production attempts; counting them into a size inflates it, measured at
-    nine times over on one campaign.
+    Explicit is not the same as widest. The split is catalog versus size:
+    counting or naming DATASETS is a catalog question, so use '*' — a dataset
+    that exists still exists after it is invalidated. Adding up BYTES, EVENTS
+    or FILES is a size question, so use 'VALID' — non-valid datasets are
+    failed and superseded attempts. Both mistakes are large and measured: '*'
+    on a how-big question came out nine times too high, and 'VALID' on a
+    how-many-datasets question left out a third of the catalog.
     `group_by` is auto|none|tier|stream|version|status. Dataset, byte, file
     and block counts always come back together, because one block scan pays
     for all four; add "events" to `metrics` to also pay one call per dataset
