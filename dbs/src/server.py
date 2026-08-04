@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import os
+import time
 from functools import lru_cache
 from typing import Any
 from dbs.apis.dbsClient import DbsApi
@@ -12,11 +13,40 @@ from mcp.server.fastmcp import FastMCP
 
 
 DEFAULT_DBS_URL = "https://cmsweb.cern.ch/dbs/prod/global/DBSReader/"
-WRITE_METHOD_PREFIXES = ("insert", "submit", "remove")
-BLOCKED_METHODS = {
-    "requestTimingInfo",
-    "requestContentLength",
-}
+# This server is read-only: only these DbsApi methods are reachable, checked
+# before any HTTP. (The old write-prefix filter was never applied anywhere.)
+READ_METHOD_ALLOWLIST = frozenset(
+    {
+        "serverinfo",
+        "help",
+        "blockDump",
+        "listDatasets",
+        "listFiles",
+        "listBlocks",
+        "listRuns",
+        "listRunSummaries",
+        "listFileSummaries",
+        "listBlockSummaries",
+        "listFileLumis",
+        "listDatasetParents",
+        "listDatasetChildren",
+        "listBlockParents",
+        "listBlockChildren",
+        "listFileParents",
+        "listFileChildren",
+        "listBlockOrigin",
+        "listAcquisitionEras",
+        "listProcessingEras",
+        "listDataTiers",
+        "listDataTypes",
+        "listPhysicsGroups",
+        "listDatasetAccessTypes",
+        "listPrimaryDatasets",
+        "listPrimaryDSTypes",
+        "listReleaseVersions",
+        "listOutputConfigs",
+    }
+)
 
 host = os.getenv("MCP_HOST", "0.0.0.0")
 port = int(os.getenv("MCP_PORT", "8013"))
@@ -38,6 +68,16 @@ def _env_int(name: str, default: int) -> int:
         return int(value)
     except ValueError as exc:
         raise ValueError(f"{name} must be an integer, got {value!r}") from exc
+
+
+def _env_float(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a number, got {value!r}") from exc
 
 
 @lru_cache(maxsize=1)
@@ -64,7 +104,7 @@ def _public_methods() -> dict[str, Any]:
     client = _dbs_client()
     methods: dict[str, Any] = {}
     for name in dir(client):
-        if name.startswith("_") or name in BLOCKED_METHODS:
+        if name.startswith("_") or name not in READ_METHOD_ALLOWLIST:
             continue
         attr = getattr(client, name)
         if callable(attr):
@@ -78,7 +118,10 @@ def _get_method(name: str) -> Any:
         return methods[name]
     except KeyError as exc:
         available = ", ".join(sorted(methods))
-        raise ValueError(f"Unsupported DBS method {name!r}. Available methods: {available}") from exc
+        raise ValueError(
+            f"DBS method {name!r} is not available: this server is read-only. "
+            f"Allowed methods: {available}"
+        ) from exc
 
 
 def _call_dbs_method(method_name: str, kwargs: dict[str, Any] | None = None, payload: Any = None) -> Any:
@@ -119,8 +162,10 @@ def _call_dbs_method(method_name: str, kwargs: dict[str, Any] | None = None, pay
 
 @mcp.tool()
 def dbs_server_info() -> Any:
-    """Return metadata from the configured DBS server."""
-    return _dbs_client().serverinfo()
+    """Return the configured DBS server's version and instance URL."""
+    info = _dbs_client().serverinfo()
+    rows = info if isinstance(info, list) else [info]
+    return [dict(r, instance=_dbs_instance()) if isinstance(r, dict) else r for r in rows]
 
 
 @mcp.tool()
@@ -145,15 +190,15 @@ def dbs_method_help(method: str) -> dict[str, str]:
 
 @mcp.tool()
 def dbs_call(method: str, kwargs: dict[str, Any] | None = None, payload: Any = None) -> Any:
-    """Call any public method on dbs.apis.dbsClient.DbsApi.
+    """Call a READ method on dbs.apis.dbsClient.DbsApi (write methods are blocked).
 
-    Use `kwargs` for parameter-style DBS methods such as `listDatasets` or
-    `updateFileStatus`. Use `payload` for object-style methods such as
-    `insertDataset`, `insertBulkBlock`, `submitMigration`, and
-    `removeMigration`.
+    Use `kwargs` for parameter-style DBS read methods such as `listDatasets`
+    or `listFileSummaries`. Prefer the task tools when one fits: totals and
+    per-group sums -> dbs_aggregate; one dataset or block's full picture ->
+    dbs_summary.
     """
-    try: 
-        return _call_dbs_method(method, kwargs=kwargs, payload=payload)
+    try:
+        return _bounded(_call_dbs_method(method, kwargs=kwargs, payload=payload))
     except Exception:
         import traceback
         traceback.print_exc()
@@ -170,7 +215,12 @@ def dbs_list_datasets(
     run_num: int | str | list[Any] | None = None,
     detail: bool = False,
 ) -> Any:
-    """List DBS datasets with common filters."""
+    """List DBS dataset NAMES matching filters.
+
+    Pass dataset_access_type explicitly ('*' for every status): the server
+    silently shows VALID only when it is omitted. For counts or totals use
+    dbs_aggregate instead of listing and counting here.
+    """
     kwargs = _drop_none(
         {
             "dataset": dataset,
@@ -182,7 +232,13 @@ def dbs_list_datasets(
             "detail": detail,
         }
     )
-    return _dbs_client().listDatasets(**kwargs)
+    result = _bounded(_dbs_client().listDatasets(**kwargs))
+    if dataset_access_type is None:
+        if isinstance(result, str):
+            result = f"{result}. {VALID_DEFAULT_NOTE}"
+        elif isinstance(result, list):
+            result = result + [VALID_DEFAULT_NOTE]
+    return result
 
 
 @mcp.tool()
@@ -194,7 +250,12 @@ def dbs_list_files(
     detail: bool = False,
     validFileOnly: int | None = None,
 ) -> Any:
-    """List DBS files with common filters."""
+    """List DBS files matching filters.
+
+    Narrow with run_num, block_name or logical_file_name; an unfiltered
+    dataset listing can return hundreds of thousands of records. For a
+    dataset's file COUNT use dbs_summary.
+    """
     kwargs = _drop_none(
         {
             "dataset": dataset,
@@ -205,7 +266,7 @@ def dbs_list_files(
             "validFileOnly": validFileOnly,
         }
     )
-    return _dbs_client().listFiles(**kwargs)
+    return _bounded(_dbs_client().listFiles(**kwargs))
 
 
 @mcp.tool()
@@ -217,7 +278,12 @@ def dbs_list_blocks(
     run_num: int | str | list[Any] | None = None,
     detail: bool = False,
 ) -> Any:
-    """List DBS blocks with common filters."""
+    """List DBS blocks matching filters.
+
+    run_num works here (it does not on the summary endpoints). Note the
+    server ignores open_for_writing as a filter and applies no dataset
+    status filter. For block counts and sizes use dbs_summary.
+    """
     kwargs = _drop_none(
         {
             "dataset": dataset,
@@ -228,7 +294,7 @@ def dbs_list_blocks(
             "detail": detail,
         }
     )
-    return _dbs_client().listBlocks(**kwargs)
+    return _bounded(_dbs_client().listBlocks(**kwargs))
 
 
 @mcp.tool()
@@ -238,7 +304,11 @@ def dbs_list_runs(
     logical_file_name: str | None = None,
     run_num: int | str | list[Any] | None = None,
 ) -> Any:
-    """List run numbers for a dataset, block, file, or explicit run filter."""
+    """List run numbers for a dataset, block, file, or explicit run filter.
+
+    Returns raw run numbers, unsorted, on an all-files basis. For a run
+    range plus counts use dbs_summary.
+    """
     kwargs = _drop_none(
         {
             "dataset": dataset,
@@ -247,17 +317,733 @@ def dbs_list_runs(
             "run_num": run_num,
         }
     )
-    return _dbs_client().listRuns(**kwargs)
+    return _bounded(_dbs_client().listRuns(**kwargs))
 
 
 @mcp.tool()
 def dbs_block_dump(block_name: str) -> Any:
-    """Return all DBS information related to a block."""
-    return _dbs_client().blockDump(block_name=block_name)
+    """Return all DBS information related to a block (large).
+
+    For a block's size, files, events, open flag and origin site, prefer
+    dbs_summary with the block name as subject.
+    """
+    return _bounded(_dbs_client().blockDump(block_name=block_name))
 
 
 def _drop_none(values: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in values.items() if value is not None}
+
+
+VALID_DEFAULT_NOTE = (
+    "note: VALID datasets only (server default); "
+    "pass dataset_access_type='*' for all statuses"
+)
+
+
+def _bounded(result: Any) -> Any:
+    """Empty results say so; oversized results are cut with an honest note."""
+    import json
+
+    if isinstance(result, list) and not result:
+        return "0 rows matched"
+    cap = _env_int("DBS_RESULT_CAP_BYTES", 262144)
+    if isinstance(result, list):
+        try:
+            size = len(json.dumps(result, default=str))
+        except (TypeError, ValueError):
+            return result
+        if size <= cap:
+            return result
+        total = len(result)
+        kept: list[Any] = []
+        used = 2
+        for row in result:
+            row_size = len(json.dumps(row, default=str)) + 2
+            if used + row_size > cap:
+                break
+            kept.append(row)
+            used += row_size
+        kept.append(
+            f"truncated: showing {len(kept)} of {total} records; "
+            "narrow the query for the rest"
+        )
+        return kept
+    try:
+        size = len(json.dumps(result, default=str))
+    except (TypeError, ValueError):
+        return result
+    if size <= cap:
+        return result
+    return (
+        f"truncated: the full object is {size} bytes, above the "
+        f"{cap}-byte result cap; use a narrower tool or query"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Task tools. These do the DBS-specific reasoning once, in code, instead of
+# leaving each conversation to rediscover the server's traps.
+# ---------------------------------------------------------------------------
+
+# validFileOnly is PRESENCE-checked by the server: sending 0 behaves like 1, so
+# the all-files call must omit the key. The flag also silently restricts to
+# datasets whose access type is VALID or PRODUCTION.
+VALID_SIDE_STATUSES = frozenset({"VALID", "PRODUCTION"})
+RUCIO_NOTE = (
+    "origin_site is bookkeeping history (where blocks were produced or injected), "
+    "not current location; ask Rucio for replicas."
+)
+
+
+def _utc_now() -> str:
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _epoch_to_day(value: Any) -> str | None:
+    from datetime import datetime, timezone
+
+    try:
+        return datetime.fromtimestamp(int(value), tz=timezone.utc).strftime("%Y-%m-%d")
+    except (TypeError, ValueError, OSError):
+        return None
+
+
+def _first_row(rows: Any) -> dict[str, Any]:
+    if isinstance(rows, list) and rows and isinstance(rows[0], dict):
+        return rows[0]
+    return {}
+
+
+def _rows(value: Any) -> list[dict[str, Any]]:
+    return [row for row in value if isinstance(row, dict)] if isinstance(value, list) else []
+
+
+def _dbs_instance() -> str:
+    return os.getenv("DBS_URL", DEFAULT_DBS_URL)
+
+
+def _repro_lines(subject: str, kind: str) -> list[str]:
+    base = _dbs_instance().rstrip("/")
+    if kind == "block":
+        quoted = subject.replace("#", "%23")
+        return [
+            f"dasgoclient --query 'summary block={subject}'",
+            f"curl -s '{base}/blocksummaries?block_name={quoted}' --cert $X509_USER_PROXY --key $X509_USER_PROXY",
+        ]
+    return [
+        f"dasgoclient --query 'summary dataset={subject}'",
+        f"curl -s '{base}/filesummaries?dataset={subject}' --cert $X509_USER_PROXY --key $X509_USER_PROXY",
+    ]
+
+
+def _did_you_mean(client: Any, dataset: str, limit: int = 10) -> list[str]:
+    """One bounded probe: keep the primary dataset name, widen the rest."""
+    parts = dataset.strip("/").split("/")
+    if len(parts) != 3:
+        return []
+    pattern = f"/{parts[0]}/*/{parts[2]}"
+    try:
+        rows = client.listDatasets(dataset=pattern, dataset_access_type="*")
+    except Exception:
+        return []
+    return [row.get("dataset") for row in _rows(rows) if row.get("dataset")][:limit]
+
+
+def _relaxed_patterns(pattern: str) -> list[str]:
+    """Widen one path segment at a time by appending a wildcard.
+
+    /HIForward/Era-v1/AOD -> /HIForward*/Era-v1/AOD, /HIForward/Era-v1*/AOD,
+    /HIForward/Era-v1/AOD*. Segments that already carry a wildcard are left
+    alone, so a fully wildcarded pattern produces no probes at all.
+
+    A segment is widened ONLY if some other segment is still specific. That
+    other segment is the anchor DBS searches on. Without one, widening asks
+    for the whole catalog: /*/*/NANOAO -> /*/*/NANOAO* measured at 277 s,
+    well past the 120 s at which the caller kills the tool. A probe that
+    costs more than the query it rescues is not help.
+    """
+    parts = pattern.strip("/").split("/")
+    if len(parts) != 3:
+        return []
+    specific = [i for i, part in enumerate(parts) if part and "*" not in part]
+    if len(specific) < 2:
+        return []
+    out = []
+    for i in specific:
+        widened = list(parts)
+        widened[i] = parts[i] + "*"
+        out.append("/" + "/".join(widened))
+    return out
+
+
+def _tier_chunk_patterns(pattern: str, names: list[str]) -> list[str]:
+    """Split a broad block scan into one pattern per data tier.
+
+    A whole-era listBlocks is more than DBS will reliably serve: measured
+    2026-08-04, /*/HIRun2026A*/* ran 312 s and the server then dropped the
+    HTTP/2 stream with INTERNAL_ERROR. The same call had worked earlier the
+    same day, so the limit is real but not predictable. The caller kills any
+    tool at 120 s, so one giant request can never be depended on.
+
+    The tier is always the third path segment, so this works for any broad
+    pattern. A pattern that already names one tier is left alone.
+    """
+    parts = pattern.strip("/").split("/")
+    if len(parts) != 3 or "*" not in parts[2]:
+        return []
+    tiers = sorted({n.rsplit("/", 1)[-1] for n in names if n.count("/") == 3})
+    if len(tiers) < 2:
+        return []
+    return ["/" + "/".join([parts[0], parts[1], tier]) for tier in tiers]
+
+
+def _fresh_client() -> Any:
+    """A client for one worker thread. The cached one is shared, and the DBS
+    client wraps libcurl, which is not safe to drive from several threads."""
+    wrapped = getattr(_dbs_client, "__wrapped__", None)
+    return wrapped() if wrapped is not None else _dbs_client()
+
+
+class ScanResult:
+    """What a block scan managed to collect, and what it did not."""
+
+    def __init__(self) -> None:
+        self.rows: list[dict[str, Any]] = []
+        self.calls = 0
+        self.failed: list[str] = []      # chunk patterns DBS refused
+        self.unscanned: list[str] = []   # chunk patterns the budget cut off
+
+    @property
+    def complete(self) -> bool:
+        return not self.failed and not self.unscanned
+
+
+def _scan_blocks(client: Any, pattern: str, names: list[str]) -> ScanResult:
+    """Block records for the pattern, inside a wall-clock budget.
+
+    The caller kills a tool at 120 s and this data does not fit: measured
+    2026-08-04, one whole-era request took 312 s before the server dropped it,
+    and even a single large tier did not return inside 400 s. So the scan is
+    split per tier, run concurrently, and stopped when the budget is spent.
+    Whatever is missing is named, never quietly counted as zero.
+    """
+    result = ScanResult()
+    chunk_min = _env_int("DBS_SCAN_CHUNK_MIN", 200)
+    chunks = _tier_chunk_patterns(pattern, names) if (
+        chunk_min > 0 and len(names) >= chunk_min) else []
+    # Even one un-splittable scan runs through the pool, so the budget applies
+    # to it too. A single large tier can outlast the caller's limit on its own:
+    # /*/HIRun2026A*/ALCARECO did not return inside 400 s.
+    if not chunks:
+        chunks = [pattern]
+
+    # Under the caller's 120 s, with room for the name lookup and serialization.
+    budget = _env_float("DBS_SCAN_BUDGET_S", 75.0)
+    workers = max(1, _env_int("DBS_SCAN_WORKERS", 6))
+    started = time.monotonic()
+
+    def out_of_time() -> bool:
+        return budget > 0 and time.monotonic() - started >= budget
+
+    def one(chunk: str) -> list[dict[str, Any]]:
+        worker_client = client if workers == 1 else _fresh_client()
+        return _rows(worker_client.listBlocks(dataset=chunk, detail=True))
+
+    if workers == 1:
+        for index, chunk in enumerate(chunks):
+            if index and out_of_time():
+                result.unscanned.extend(chunks[index:])
+                break
+            result.calls += 1
+            try:
+                result.rows.extend(one(chunk))
+            except Exception as exc:
+                result.failed.append(f"{chunk}: {exc}")
+        return result
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    # Deliberately not a `with` block. Exiting the context manager joins every
+    # worker, and a thread already inside a slow DBS call cannot be cancelled —
+    # so `with` would wait out the very stall the budget exists to escape.
+    # shutdown(wait=False) lets this return on time; the stragglers finish into
+    # results nobody reads and then exit.
+    pool = ThreadPoolExecutor(max_workers=min(workers, len(chunks)))
+    futures = {pool.submit(one, chunk): chunk for chunk in chunks}
+    try:
+        for future in as_completed(futures, timeout=budget if budget > 0 else None):
+            result.calls += 1
+            try:
+                result.rows.extend(future.result())
+            except Exception as exc:
+                result.failed.append(f"{futures[future]}: {exc}")
+    except Exception:  # TimeoutError from as_completed: the budget ran out
+        pass
+    for future, chunk in futures.items():
+        if not future.done():
+            result.unscanned.append(chunk)
+    pool.shutdown(wait=False, cancel_futures=True)
+    return result
+
+
+def _probe_budget_s() -> float:
+    try:
+        return float(os.environ.get("DBS_PROBE_BUDGET_S", "15"))
+    except ValueError:
+        return 15.0
+
+
+def _probe_wider_patterns(client: Any, pattern: str,
+                          status: str) -> tuple[list[dict[str, Any]], int, bool]:
+    """Which wider patterns actually hold data?
+
+    Returns (suggestions, calls_made, ran_out_of_time).
+
+    A zero result is the one answer a model cannot check, so it invents a
+    reason instead. Handing back a pattern that DOES match turns a dead end
+    into a next step. Bounded twice: at most one probe per specific segment,
+    and a wall-clock budget checked between probes so a slow server costs one
+    probe instead of three.
+    """
+    budget = _probe_budget_s()
+    if budget <= 0:
+        return [], 0, False
+
+    found: list[dict[str, Any]] = []
+    calls = 0
+    started = time.monotonic()
+    for candidate in _relaxed_patterns(pattern):
+        if calls and time.monotonic() - started >= budget:
+            return found, calls, True
+        calls += 1
+        try:
+            rows = _rows(client.listDatasets(dataset=candidate,
+                                             dataset_access_type=status))
+        except Exception:
+            continue
+        names = [r.get("dataset") for r in rows if r.get("dataset")]
+        if names:
+            found.append({"pattern": candidate, "n_datasets": len(names),
+                          "example": sorted(names)[0]})
+    return found, calls, False
+
+
+@mcp.tool()
+def dbs_summary(subject: str) -> dict[str, Any]:
+    """Full picture of ONE dataset or block: status, size, events, files
+    (valid and invalid sides), lumis, blocks and open blocks, activity dates,
+    run range and origin sites, with provenance and reproduction commands.
+
+    `subject` is an exact dataset path (/primary/processed/TIER) or a block
+    name (a path with a #hash). Use this instead of stitching together
+    listDatasets, listFileSummaries and listBlocks by hand. For totals over
+    MANY datasets use dbs_aggregate.
+    """
+    client = _dbs_client()
+    calls = 0
+    is_block = "#" in subject
+
+    if is_block:
+        summaries = client.listBlockSummaries(block_name=subject)
+        calls += 1
+        blocks = _rows(client.listBlocks(block_name=subject, detail=True))
+        calls += 1
+        row = _first_row(summaries)
+        block_row = blocks[0] if blocks else {}
+        created = [b.get("creation_date") for b in blocks if b.get("creation_date")]
+        summary: dict[str, Any] = {
+            "subject": subject,
+            "subject_kind": "block",
+            "found": bool(summaries or blocks),
+            "dataset": block_row.get("dataset"),
+            "bytes_all_files": row.get("file_size"),
+            "events_all_files": row.get("num_event"),
+            "n_files_all": row.get("num_file"),
+            "n_blocks": len(blocks),
+            "n_open_blocks": sum(1 for b in blocks if b.get("open_for_writing")),
+            "origin_sites": _site_counts(blocks),
+            "oldest_block_created": _epoch_to_day(min(created)) if created else None,
+            "newest_block_created": _epoch_to_day(max(created)) if created else None,
+        }
+        return _envelope(summary, subject, "block", calls, status_filter="n/a")
+
+    # Dataset subject. Existence first, with '*' so an invalidated dataset is
+    # never mistaken for a missing one (DBS answers 200 + empty list for both).
+    found_rows = _rows(client.listDatasets(dataset=subject, dataset_access_type="*", detail=True))
+    calls += 1
+    if not found_rows:
+        summary = {
+            "subject": subject,
+            "subject_kind": "dataset",
+            "found": False,
+            "did_you_mean": _did_you_mean(client, subject),
+        }
+        calls += 1
+        return _envelope(summary, subject, "dataset", calls)
+
+    meta = found_rows[0]
+    status = meta.get("dataset_access_type")
+    all_row = _first_row(client.listFileSummaries(dataset=subject))
+    calls += 1
+
+    valid_row: dict[str, Any] = {}
+    valid_reason = None
+    if status in VALID_SIDE_STATUSES:
+        valid_row = _first_row(client.listFileSummaries(dataset=subject, validFileOnly=1))
+        calls += 1
+    else:
+        valid_reason = "gated_by_access_type"
+
+    blocks = _rows(client.listBlocks(dataset=subject, detail=True))
+    calls += 1
+    runs = sorted({r.get("run_num") for r in _rows(client.listRuns(dataset=subject))
+                   if r.get("run_num") is not None})
+    calls += 1
+    created = [b.get("creation_date") for b in blocks if b.get("creation_date")]
+
+    n_all = all_row.get("num_file")
+    n_valid = valid_row.get("num_file") if valid_row else None
+    summary = {
+        "subject": subject,
+        "subject_kind": "dataset",
+        "found": True,
+        "status": status,
+        "tier": meta.get("data_tier_name") or subject.rstrip("/").split("/")[-1],
+        "bytes_all_files": all_row.get("file_size"),
+        "bytes_valid_files": valid_row.get("file_size") if valid_row else None,
+        "events_all_files": all_row.get("num_event"),
+        "events_valid_files": valid_row.get("num_event") if valid_row else None,
+        "n_files_all": n_all,
+        "n_files_valid": n_valid,
+        "n_files_invalid": (n_all - n_valid) if (n_all is not None and n_valid is not None) else None,
+        "n_lumis": all_row.get("num_lumi"),
+        "n_blocks": len(blocks),
+        "n_open_blocks": sum(1 for b in blocks if b.get("open_for_writing")),
+        "oldest_block_created": _epoch_to_day(min(created)) if created else None,
+        "newest_block_created": _epoch_to_day(max(created)) if created else None,
+        "n_runs": len(runs),
+        "run_min": runs[0] if runs else None,
+        "run_max": runs[-1] if runs else None,
+        "runs_basis": "all_files",
+        "origin_sites": _site_counts(blocks),
+    }
+    if valid_reason:
+        summary["valid_side_null_reason"] = valid_reason
+    if status and status != "VALID":
+        summary["invalidated_on"] = _epoch_to_day(meta.get("last_modification_date"))
+        summary["invalidated_by"] = meta.get("last_modified_by")
+
+    diagnosis = _diagnose_zero_row(all_row, wildcard_sent="*" in subject,
+                                   status=status, flag_sent=False)
+    if diagnosis:
+        summary["zero_row_diagnosis"] = diagnosis
+    return _envelope(summary, subject, "dataset", calls)
+
+
+def _site_counts(blocks: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for block in blocks:
+        site = block.get("origin_site_name")
+        if site:
+            counts[site] = counts.get(site, 0) + 1
+    return counts
+
+
+def _diagnose_zero_row(row: dict[str, Any], *, wildcard_sent: bool,
+                       status: str | None, flag_sent: bool) -> str | None:
+    """An all-zero summary row is usually a trap, not data. num_block tells which."""
+    if not row or any(row.get(k) for k in ("file_size", "num_file", "num_event")):
+        return None
+    if row.get("num_block"):
+        return ("zeros with a non-zero block count: the validFileOnly gate gated this "
+                "dataset (its access type is outside VALID/PRODUCTION)")
+    if wildcard_sent:
+        return ("zeros with no blocks: a wildcard reached a summaries API, which returns "
+                "an all-zero row instead of an error; query one exact dataset")
+    return "zeros with no blocks: nothing matched this exact path"
+
+
+def _envelope(summary: dict[str, Any], subject: str, kind: str, calls: int,
+              status_filter: str = "*") -> dict[str, Any]:
+    return {
+        "summary": summary,
+        "provenance": {
+            "instance": _dbs_instance(),
+            "status_filter": status_filter,
+            "validity_basis": "both_sides_reported",
+            "queried_utc": _utc_now(),
+            "n_server_calls": calls,
+        },
+        "repro": _repro_lines(subject, kind),
+        "note": RUCIO_NOTE,
+    }
+
+
+GROUP_KEYS = ("auto", "none", "tier", "stream", "version", "status")
+DEFAULT_METRICS = ("count", "bytes", "files", "blocks")
+VALID_METRICS = ("count", "bytes", "files", "blocks", "events")
+
+
+def _group_of(dataset: str, row: dict[str, Any], key: str) -> str:
+    parts = dataset.strip("/").split("/")
+    if key == "tier":
+        return parts[2] if len(parts) == 3 else "unknown"
+    if key == "stream":
+        return parts[0] if parts else "unknown"
+    if key == "version":
+        processed = parts[1] if len(parts) == 3 else ""
+        return processed.rsplit("-", 1)[-1] if "-" in processed else (processed or "unknown")
+    if key == "status":
+        return row.get("dataset_access_type") or "unknown"
+    return "all"
+
+
+@mcp.tool()
+def dbs_aggregate(
+    pattern: str,
+    status: str = "VALID",
+    group_by: str = "auto",
+    metrics: list[str] | None = None,
+    count_only: bool = False,
+) -> dict[str, Any]:
+    """Totals and per-group sums over MANY datasets, computed here, not in chat.
+
+    Answers questions like "how much data is in this era, by tier" or "how
+    many datasets match this pattern". `pattern` is a dataset wildcard such as
+    /*/HIRun2026A*/AOD. `status` must be explicit ('VALID', 'INVALID', '*',
+    ...) because the DBS default silently hides everything that is not VALID.
+    Explicit is not the same as widest. The split is catalog versus size:
+    counting or naming DATASETS is a catalog question, so use '*' — a dataset
+    that exists still exists after it is invalidated. Adding up BYTES, EVENTS
+    or FILES is a size question, so use 'VALID' — non-valid datasets are
+    failed and superseded attempts. Both mistakes are large and measured: '*'
+    on a how-big question came out nine times too high, and 'VALID' on a
+    how-many-datasets question left out a third of the catalog.
+    `group_by` is auto|none|tier|stream|version|status. Dataset, byte, file
+    and block counts always come back together, because one block scan pays
+    for all four; add "events" to `metrics` to also pay one call per dataset
+    for event counts. An unknown metric name is an error, never ignored. Set
+    `count_only` for a pure count with no block scan at all.
+
+    If the pattern matches nothing, the reply carries `did_you_mean`: wider
+    patterns that DO hold data. Re-run with one of those instead of reporting
+    zero.
+
+    The reply's size follows the number of GROUPS, never the number of
+    datasets, so it is safe on a whole era. Eras are selected by name pattern:
+    there is deliberately no era-name parameter, because the server ignores
+    that filter and answers with the entire catalog.
+    """
+    if group_by not in GROUP_KEYS:
+        raise ValueError(f"group_by must be one of {', '.join(GROUP_KEYS)}")
+    unknown = [m for m in (metrics or ()) if m not in VALID_METRICS]
+    if unknown:
+        # Accepting a metric and ignoring it is exactly the DBS behavior this
+        # server exists to stop. Fail loudly, before spending a call.
+        raise ValueError(
+            f"unknown metric(s): {', '.join(unknown)}. "
+            f"Valid metrics are {', '.join(VALID_METRICS)}."
+        )
+    # count, bytes, files and blocks all fall out of the same single block
+    # scan, so they are always returned; `metrics` only decides whether to pay
+    # the per-dataset cost of events.
+    wanted = list(DEFAULT_METRICS)
+    if "events" in (metrics or ()):
+        wanted.append("events")
+    client = _dbs_client()
+    calls = 0
+
+    rows = _rows(client.listDatasets(dataset=pattern, dataset_access_type=status, detail=True))
+    calls += 1
+    names = [r.get("dataset") for r in rows if r.get("dataset")]
+    by_name = {r.get("dataset"): r for r in rows}
+    n_matched = len(names)
+
+    if group_by == "auto":
+        tiers = {_group_of(n, by_name[n], "tier") for n in names}
+        group_by = "tier" if len(tiers) > 1 else "none"
+
+    groups: dict[str, dict[str, Any]] = {}
+    for name in names:
+        key = _group_of(name, by_name[name], group_by)
+        groups.setdefault(key, {"group": key, "n_datasets": 0, "datasets": []})
+        groups[key]["n_datasets"] += 1
+        groups[key]["datasets"].append(name)
+
+    coverage = {"n_matched": n_matched, "n_summed": 0, "n_failed": 0,
+                "complete": True, "truncation_reason": None}
+
+    if count_only or n_matched == 0:
+        out_groups = [{"group": g["group"], "n_datasets": g["n_datasets"]}
+                      for g in groups.values()]
+        totals = {"n_datasets": n_matched}
+        suggestions: list[dict[str, Any]] = []
+        if n_matched == 0:
+            suggestions, probe_calls, timed_out = _probe_wider_patterns(
+                client, pattern, status)
+            calls += probe_calls
+            hint = (f"no datasets match this pattern at status {status}; "
+                    "check the name or widen the status")
+            if timed_out and not suggestions:
+                hint += " (gave up probing wider names: time budget spent)"
+            if suggestions:
+                best = max(suggestions, key=lambda s: s["n_datasets"])
+                hint = (f"no datasets match {pattern} at status {status}, but "
+                        f"{best['pattern']} matches {best['n_datasets']}. "
+                        "Re-run with that pattern; do NOT report zero.")
+        else:
+            hint = ("counts come from dataset names; ask for bytes to pay for "
+                    "the block scan")
+        envelope = _agg_envelope(out_groups, totals, coverage, pattern, status,
+                                 calls, hint)
+        if n_matched == 0:
+            envelope["did_you_mean"] = suggestions
+        return envelope
+
+    # Sizes: one status-blind blocks scan per pattern, intersected client-side
+    # against the resolved names. The blocks API applies NO status filter, so
+    # skipping the intersect overcounts by an unbounded factor.
+    wanted_set = set(names)
+    scan = _scan_blocks(client, pattern, names)
+    blocks = scan.rows
+    calls += scan.calls
+    missing_chunks = scan.unscanned + [f.split(":", 1)[0] for f in scan.failed]
+    missing_tiers = {c.rsplit("/", 1)[-1] for c in missing_chunks}
+    if not scan.complete:
+        coverage["complete"] = False
+        coverage["n_failed"] = len(missing_chunks)
+        parts = []
+        if scan.unscanned:
+            parts.append("time budget spent before scanning "
+                         + ", ".join(sorted(scan.unscanned)))
+        if scan.failed:
+            parts.append("DBS refused " + "; ".join(scan.failed))
+        coverage["truncation_reason"] = "; ".join(parts)
+    for block in blocks:
+        owner = block.get("dataset")
+        if owner not in wanted_set:
+            continue
+        key = _group_of(owner, by_name[owner], group_by)
+        bucket = groups.setdefault(key, {"group": key, "n_datasets": 0, "datasets": []})
+        bucket["bytes"] = bucket.get("bytes", 0) + (block.get("block_size") or 0)
+        bucket["files"] = bucket.get("files", 0) + (block.get("file_count") or 0)
+        bucket["n_blocks"] = bucket.get("n_blocks", 0) + 1
+    coverage["n_summed"] = n_matched
+
+    events_total = None
+    events_reason = None
+    if "events" in wanted:
+        cap = _env_int("DBS_MAX_DATASETS_SUMMED", 60)
+        if n_matched > cap:
+            events_reason = (
+                f"{n_matched} datasets exceed the {cap}-dataset event cap; events need one "
+                "call per dataset. Narrow the pattern (for example per tier) to get them."
+            )
+        else:
+            events_total = 0
+            for name in names:
+                row = by_name[name]
+                kwargs: dict[str, Any] = {"dataset": name}
+                # validFileOnly is presence-checked and gates non-VALID datasets,
+                # so it is sent only where it is both meaningful and harmless.
+                if row.get("dataset_access_type") in VALID_SIDE_STATUSES and status != "*":
+                    kwargs["validFileOnly"] = 1
+                summary = _first_row(client.listFileSummaries(**kwargs))
+                calls += 1
+                events_total += summary.get("num_event") or 0
+                key = _group_of(name, row, group_by)
+                bucket = groups.setdefault(key, {"group": key, "n_datasets": 0, "datasets": []})
+                bucket["events"] = bucket.get("events", 0) + (summary.get("num_event") or 0)
+
+    # A group whose tier was never scanned has no size data. Reporting 0 there
+    # would be a number a reader adds up; null with a flag cannot be.
+    def _unscanned(group_key: str, member_names: list[str]) -> bool:
+        if not missing_tiers:
+            return False
+        tiers = {n.rsplit("/", 1)[-1] for n in member_names}
+        return bool(tiers) and tiers <= missing_tiers
+
+    out_groups = []
+    for g in sorted(groups.values(), key=lambda x: -x["n_datasets"]):
+        row = {"group": g["group"], "n_datasets": g["n_datasets"]}
+        blind = _unscanned(g["group"], g.get("datasets", []))
+        for metric, field in (("bytes", "bytes"), ("files", "files"), ("blocks", "n_blocks")):
+            if metric in wanted:
+                row[field] = None if blind else g.get(field, 0)
+        if "events" in wanted and events_total is not None:
+            row["events"] = g.get("events", 0)
+        if blind:
+            row["scanned"] = False
+        out_groups.append(row)
+
+    totals: dict[str, Any] = {"n_datasets": n_matched}
+    if "bytes" in wanted:
+        totals["bytes"] = sum(g.get("bytes", 0) for g in groups.values())
+    if "files" in wanted:
+        totals["files"] = sum(g.get("files", 0) for g in groups.values())
+    if "blocks" in wanted:
+        totals["blocks"] = sum(g.get("n_blocks", 0) for g in groups.values())
+    if "events" in wanted:
+        totals["events"] = events_total
+        if events_reason:
+            totals["events_null_reason"] = events_reason
+
+    tiers_present = {_group_of(n, by_name[n], "tier") for n in names}
+    hint = "bytes and files come from block records; events need one call per dataset"
+    if "events" in wanted and len(tiers_present) > 1:
+        hint = ("events across more than one tier double-count the same physics events; "
+                "sum events within one tier only")
+
+    if missing_chunks:
+        follow_up = ", ".join(sorted(set(missing_chunks)))
+        totals["partial"] = True
+        totals["bytes_partial_reason"] = (
+            f"{len(missing_chunks)} of {len(tiers_present)} tiers were not scanned, "
+            "so this total is a floor, not the answer")
+        if set(missing_chunks) == {pattern}:
+            # Nothing was split, so repeating the same pattern would just stall
+            # again. Narrowing the primary name is the only way down.
+            head = pattern.strip("/").split("/")[0].rstrip("*")
+            example = "/" + "/".join([(head or "") + "A*"]
+                                     + pattern.strip("/").split("/")[1:])
+            totals["bytes_partial_reason"] = (
+                "this pattern is too large to size inside the time budget")
+            hint = ("NO SIZE DATA — the scan did not finish and nothing here is a "
+                    f"total. {pattern} cannot be sized in one call. Narrow the "
+                    f"primary dataset name and sum the parts, e.g. {example}, or "
+                    "size one dataset at a time with dbs_summary.")
+        else:
+            hint = ("PARTIAL TOTAL — do not present it as the total. Missing tiers: "
+                    f"{follow_up}. Call dbs_aggregate once per missing pattern and add "
+                    "the results, or say which tiers are missing.")
+
+    return _agg_envelope(out_groups, totals, coverage, pattern, status, calls, hint)
+
+
+def _agg_envelope(groups: list[dict[str, Any]], totals: dict[str, Any],
+                  coverage: dict[str, Any], pattern: str, status: str,
+                  calls: int, hint: str) -> dict[str, Any]:
+    base = _dbs_instance().rstrip("/")
+    return {
+        "groups": groups,
+        "totals": totals,
+        "coverage": coverage,
+        "provenance": {
+            "instance": _dbs_instance(),
+            "pattern": pattern,
+            "status_filter": status,
+            "queried_utc": _utc_now(),
+            "n_server_calls": calls,
+        },
+        "repro": [
+            f"dasgoclient --query 'dataset dataset={pattern} status={status}'",
+            f"curl -s '{base}/blocks?dataset={pattern}&detail=1' "
+            "--cert $X509_USER_PROXY --key $X509_USER_PROXY",
+        ],
+        "hint": hint,
+    }
 
 
 def main() -> None:

@@ -1,0 +1,10 @@
+{
+  "_note": "A block name as the lookup subject. blocksummaries is the only DBS route to a block's event count; the blocks detail row adds size, files, the open flag and the origin site. The # in the name must reach the client intact (the client layer handles URL encoding).",
+  "block_name": "/ParkingBPH1/Run2018D-v1/RAW#0b3f596a-dfac-494e-a28d-542249f03c8c",
+  "blocksummaries": [
+    {"file_size": 4190000000000, "num_event": 26000000, "num_file": 456}
+  ],
+  "blocks_detail": [
+    {"dataset": "/ParkingBPH1/Run2018D-v1/RAW", "block_name": "/ParkingBPH1/Run2018D-v1/RAW#0b3f596a-dfac-494e-a28d-542249f03c8c", "block_size": 4190000000000, "file_count": 456, "open_for_writing": 0, "origin_site_name": "T1_US_FNAL_Disk", "creation_date": 1540000000}
+  ]
+}

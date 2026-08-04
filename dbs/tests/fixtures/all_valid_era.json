@@ -1,0 +1,21 @@
+{
+  "_note": "The friendly fixture where the status intersect looks like a no-op (models HIRun2026A: 1,693 datasets, 100% VALID, measured 2026-08-03). The intersect must still run and must not change the numbers here.",
+  "pattern": "/*/TestHIRun2026A*/RAW",
+  "datasets_all_status": [
+    {"dataset": "/StreamA/TestHIRun2026A-v1/RAW", "dataset_access_type": "VALID"},
+    {"dataset": "/StreamB/TestHIRun2026A-v1/RAW", "dataset_access_type": "VALID"},
+    {"dataset": "/StreamC/TestHIRun2026A-v1/RAW", "dataset_access_type": "VALID"}
+  ],
+  "datasets_valid_names": [
+    "/StreamA/TestHIRun2026A-v1/RAW",
+    "/StreamB/TestHIRun2026A-v1/RAW",
+    "/StreamC/TestHIRun2026A-v1/RAW"
+  ],
+  "blocks_detail_all": [
+    {"dataset": "/StreamA/TestHIRun2026A-v1/RAW", "block_name": "/StreamA/TestHIRun2026A-v1/RAW#x1", "block_size": 111, "file_count": 1, "open_for_writing": 0, "origin_site_name": "T0_CH_CERN_Disk", "creation_date": 1750000000},
+    {"dataset": "/StreamB/TestHIRun2026A-v1/RAW", "block_name": "/StreamB/TestHIRun2026A-v1/RAW#x1", "block_size": 222, "file_count": 2, "open_for_writing": 0, "origin_site_name": "T0_CH_CERN_Disk", "creation_date": 1750100000},
+    {"dataset": "/StreamC/TestHIRun2026A-v1/RAW", "block_name": "/StreamC/TestHIRun2026A-v1/RAW#x1", "block_size": 333, "file_count": 3, "open_for_writing": 0, "origin_site_name": "T0_CH_CERN_Disk", "creation_date": 1750200000}
+  ],
+  "expected_bytes": 666,
+  "expected_files": 6
+}

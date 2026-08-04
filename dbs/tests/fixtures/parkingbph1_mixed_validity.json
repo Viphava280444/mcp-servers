@@ -1,0 +1,15 @@
+{
+  "_note": "Live-measured 2026-08-03 on prod/global: a VALID dataset that holds 26 invalid files. bytes and file counts are exact; event counts are representative but keep the measured delta of 443484. The two summaries MUST differ or the fixture is broken.",
+  "dataset": "/ParkingBPH1/Run2018D-v1/RAW",
+  "status": "VALID",
+  "filesummaries_all_files": [
+    {"file_size": 1026643407835702, "num_file": 111808, "num_event": 6423051762, "num_lumi": 40128, "num_block": 245}
+  ],
+  "filesummaries_valid_only": [
+    {"file_size": 1026368461539909, "num_file": 111782, "num_event": 6422608278, "num_lumi": 40128, "num_block": 245}
+  ],
+  "n_blocks": 245,
+  "delta_bytes": 274946295793,
+  "delta_files": 26,
+  "delta_events": 443484
+}
