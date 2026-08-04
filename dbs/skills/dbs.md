@@ -130,6 +130,12 @@ A whole era holds more block data than DBS will hand over inside one call.
   because one scan paid for all four. A "how big is it" answer that gives
   bytes but drops the dataset count is an incomplete answer. The same holds
   for `dbs_summary`: give the whole picture, not the single field asked about.
+- **Ask for events on a campaign or era summary.** Size means bytes, events
+  and files together — that is what a CompOps reader expects from "how big is
+  this campaign". Events are opt-in because they cost one call per dataset, so
+  pass `metrics=["events"]` when you want them. You do not need to guess
+  whether it is affordable: above the cap the tool returns `events: null` with
+  the reason, and never a partial sum. Ask, and pass on whatever comes back.
 - Give bytes as exact bytes **and** in human units (1 TB = 1e12 bytes).
 - Never round a count. Either give the exact number or say why it is not
   available and how to narrow the question.
