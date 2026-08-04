@@ -70,6 +70,16 @@ def _env_int(name: str, default: int) -> int:
         raise ValueError(f"{name} must be an integer, got {value!r}") from exc
 
 
+def _env_float(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a number, got {value!r}") from exc
+
+
 @lru_cache(maxsize=1)
 def _dbs_client() -> Any:
     dbs_client = DbsApi(
@@ -468,6 +478,116 @@ def _relaxed_patterns(pattern: str) -> list[str]:
     return out
 
 
+def _tier_chunk_patterns(pattern: str, names: list[str]) -> list[str]:
+    """Split a broad block scan into one pattern per data tier.
+
+    A whole-era listBlocks is more than DBS will reliably serve: measured
+    2026-08-04, /*/HIRun2026A*/* ran 312 s and the server then dropped the
+    HTTP/2 stream with INTERNAL_ERROR. The same call had worked earlier the
+    same day, so the limit is real but not predictable. The caller kills any
+    tool at 120 s, so one giant request can never be depended on.
+
+    The tier is always the third path segment, so this works for any broad
+    pattern. A pattern that already names one tier is left alone.
+    """
+    parts = pattern.strip("/").split("/")
+    if len(parts) != 3 or "*" not in parts[2]:
+        return []
+    tiers = sorted({n.rsplit("/", 1)[-1] for n in names if n.count("/") == 3})
+    if len(tiers) < 2:
+        return []
+    return ["/" + "/".join([parts[0], parts[1], tier]) for tier in tiers]
+
+
+def _fresh_client() -> Any:
+    """A client for one worker thread. The cached one is shared, and the DBS
+    client wraps libcurl, which is not safe to drive from several threads."""
+    wrapped = getattr(_dbs_client, "__wrapped__", None)
+    return wrapped() if wrapped is not None else _dbs_client()
+
+
+class ScanResult:
+    """What a block scan managed to collect, and what it did not."""
+
+    def __init__(self) -> None:
+        self.rows: list[dict[str, Any]] = []
+        self.calls = 0
+        self.failed: list[str] = []      # chunk patterns DBS refused
+        self.unscanned: list[str] = []   # chunk patterns the budget cut off
+
+    @property
+    def complete(self) -> bool:
+        return not self.failed and not self.unscanned
+
+
+def _scan_blocks(client: Any, pattern: str, names: list[str]) -> ScanResult:
+    """Block records for the pattern, inside a wall-clock budget.
+
+    The caller kills a tool at 120 s and this data does not fit: measured
+    2026-08-04, one whole-era request took 312 s before the server dropped it,
+    and even a single large tier did not return inside 400 s. So the scan is
+    split per tier, run concurrently, and stopped when the budget is spent.
+    Whatever is missing is named, never quietly counted as zero.
+    """
+    result = ScanResult()
+    chunk_min = _env_int("DBS_SCAN_CHUNK_MIN", 200)
+    chunks = _tier_chunk_patterns(pattern, names) if (
+        chunk_min > 0 and len(names) >= chunk_min) else []
+    # Even one un-splittable scan runs through the pool, so the budget applies
+    # to it too. A single large tier can outlast the caller's limit on its own:
+    # /*/HIRun2026A*/ALCARECO did not return inside 400 s.
+    if not chunks:
+        chunks = [pattern]
+
+    # Under the caller's 120 s, with room for the name lookup and serialization.
+    budget = _env_float("DBS_SCAN_BUDGET_S", 75.0)
+    workers = max(1, _env_int("DBS_SCAN_WORKERS", 6))
+    started = time.monotonic()
+
+    def out_of_time() -> bool:
+        return budget > 0 and time.monotonic() - started >= budget
+
+    def one(chunk: str) -> list[dict[str, Any]]:
+        worker_client = client if workers == 1 else _fresh_client()
+        return _rows(worker_client.listBlocks(dataset=chunk, detail=True))
+
+    if workers == 1:
+        for index, chunk in enumerate(chunks):
+            if index and out_of_time():
+                result.unscanned.extend(chunks[index:])
+                break
+            result.calls += 1
+            try:
+                result.rows.extend(one(chunk))
+            except Exception as exc:
+                result.failed.append(f"{chunk}: {exc}")
+        return result
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    # Deliberately not a `with` block. Exiting the context manager joins every
+    # worker, and a thread already inside a slow DBS call cannot be cancelled —
+    # so `with` would wait out the very stall the budget exists to escape.
+    # shutdown(wait=False) lets this return on time; the stragglers finish into
+    # results nobody reads and then exit.
+    pool = ThreadPoolExecutor(max_workers=min(workers, len(chunks)))
+    futures = {pool.submit(one, chunk): chunk for chunk in chunks}
+    try:
+        for future in as_completed(futures, timeout=budget if budget > 0 else None):
+            result.calls += 1
+            try:
+                result.rows.extend(future.result())
+            except Exception as exc:
+                result.failed.append(f"{futures[future]}: {exc}")
+    except Exception:  # TimeoutError from as_completed: the budget ran out
+        pass
+    for future, chunk in futures.items():
+        if not future.done():
+            result.unscanned.append(chunk)
+    pool.shutdown(wait=False, cancel_futures=True)
+    return result
+
+
 def _probe_budget_s() -> float:
     try:
         return float(os.environ.get("DBS_PROBE_BUDGET_S", "15"))
@@ -779,8 +899,21 @@ def dbs_aggregate(
     # against the resolved names. The blocks API applies NO status filter, so
     # skipping the intersect overcounts by an unbounded factor.
     wanted_set = set(names)
-    blocks = _rows(client.listBlocks(dataset=pattern, detail=True))
-    calls += 1
+    scan = _scan_blocks(client, pattern, names)
+    blocks = scan.rows
+    calls += scan.calls
+    missing_chunks = scan.unscanned + [f.split(":", 1)[0] for f in scan.failed]
+    missing_tiers = {c.rsplit("/", 1)[-1] for c in missing_chunks}
+    if not scan.complete:
+        coverage["complete"] = False
+        coverage["n_failed"] = len(missing_chunks)
+        parts = []
+        if scan.unscanned:
+            parts.append("time budget spent before scanning "
+                         + ", ".join(sorted(scan.unscanned)))
+        if scan.failed:
+            parts.append("DBS refused " + "; ".join(scan.failed))
+        coverage["truncation_reason"] = "; ".join(parts)
     for block in blocks:
         owner = block.get("dataset")
         if owner not in wanted_set:
@@ -817,14 +950,25 @@ def dbs_aggregate(
                 bucket = groups.setdefault(key, {"group": key, "n_datasets": 0, "datasets": []})
                 bucket["events"] = bucket.get("events", 0) + (summary.get("num_event") or 0)
 
+    # A group whose tier was never scanned has no size data. Reporting 0 there
+    # would be a number a reader adds up; null with a flag cannot be.
+    def _unscanned(group_key: str, member_names: list[str]) -> bool:
+        if not missing_tiers:
+            return False
+        tiers = {n.rsplit("/", 1)[-1] for n in member_names}
+        return bool(tiers) and tiers <= missing_tiers
+
     out_groups = []
     for g in sorted(groups.values(), key=lambda x: -x["n_datasets"]):
         row = {"group": g["group"], "n_datasets": g["n_datasets"]}
+        blind = _unscanned(g["group"], g.get("datasets", []))
         for metric, field in (("bytes", "bytes"), ("files", "files"), ("blocks", "n_blocks")):
             if metric in wanted:
-                row[field] = g.get(field, 0)
+                row[field] = None if blind else g.get(field, 0)
         if "events" in wanted and events_total is not None:
             row["events"] = g.get("events", 0)
+        if blind:
+            row["scanned"] = False
         out_groups.append(row)
 
     totals: dict[str, Any] = {"n_datasets": n_matched}
@@ -844,6 +988,30 @@ def dbs_aggregate(
     if "events" in wanted and len(tiers_present) > 1:
         hint = ("events across more than one tier double-count the same physics events; "
                 "sum events within one tier only")
+
+    if missing_chunks:
+        follow_up = ", ".join(sorted(set(missing_chunks)))
+        totals["partial"] = True
+        totals["bytes_partial_reason"] = (
+            f"{len(missing_chunks)} of {len(tiers_present)} tiers were not scanned, "
+            "so this total is a floor, not the answer")
+        if set(missing_chunks) == {pattern}:
+            # Nothing was split, so repeating the same pattern would just stall
+            # again. Narrowing the primary name is the only way down.
+            head = pattern.strip("/").split("/")[0].rstrip("*")
+            example = "/" + "/".join([(head or "") + "A*"]
+                                     + pattern.strip("/").split("/")[1:])
+            totals["bytes_partial_reason"] = (
+                "this pattern is too large to size inside the time budget")
+            hint = ("NO SIZE DATA — the scan did not finish and nothing here is a "
+                    f"total. {pattern} cannot be sized in one call. Narrow the "
+                    f"primary dataset name and sum the parts, e.g. {example}, or "
+                    "size one dataset at a time with dbs_summary.")
+        else:
+            hint = ("PARTIAL TOTAL — do not present it as the total. Missing tiers: "
+                    f"{follow_up}. Call dbs_aggregate once per missing pattern and add "
+                    "the results, or say which tiers are missing.")
+
     return _agg_envelope(out_groups, totals, coverage, pattern, status, calls, hint)
 
 

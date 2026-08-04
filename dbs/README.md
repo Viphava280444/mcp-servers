@@ -72,6 +72,16 @@ The server reads configuration from environment variables:
 - `DBS_RESULT_CAP_BYTES`: maximum serialized size of any tool result. Oversized
   lists are cut at a record boundary with a `truncated: showing X of N records`
   note. Defaults to `262144`.
+- `DBS_SCAN_BUDGET_S`: wall-clock seconds `dbs_aggregate` may spend gathering
+  block records. It always answers inside this budget; whatever it could not
+  reach is returned as `null` with the exact follow-up call named, never as
+  `0`. Defaults to `75`, chosen to sit under the 120 s at which the MCP client
+  kills a tool call. Set to `0` for no budget.
+- `DBS_SCAN_CHUNK_MIN`: dataset count above which a broad scan is split into
+  one request per data tier. A whole-era request is more than DBS will serve:
+  measured, one HIRun2026A scan ran 312 s and the server then dropped the
+  connection. Defaults to `200`; `0` disables splitting.
+- `DBS_SCAN_WORKERS`: how many tier requests run at once. Defaults to `6`.
 - `DBS_PROBE_BUDGET_S`: wall-clock seconds `dbs_aggregate` may spend probing
   wider patterns after a pattern matches nothing. Set to `0` to switch probing
   off. Defaults to `15`. A probe is only sent when some other path segment is

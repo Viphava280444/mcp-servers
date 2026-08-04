@@ -81,6 +81,20 @@ exist". Before you report a zero:
 Only after those say nothing may you answer "no such data", and then say which
 query you ran.
 
+## Partial answers are normal on big patterns
+
+A whole era holds more block data than DBS will hand over inside one call.
+`dbs_aggregate` answers with what it reached and marks the rest:
+
+- `groups[].scanned: false` with `bytes: null` means that tier was NOT
+  measured. It is not zero. Never add it in, never call it empty.
+- `totals.partial: true` means the total is a floor, not the answer.
+- `hint` names the exact follow-up calls. Make them, add the results, and
+  then give one complete total.
+- If you run out of calls, say plainly which tiers are included and which are
+  not. A total labelled "RAW, AOD and MINIAOD only" is useful. A total that
+  silently dropped ALCARECO is wrong.
+
 ## Answer discipline
 
 - State the instance, the status filter and the validity basis with any
