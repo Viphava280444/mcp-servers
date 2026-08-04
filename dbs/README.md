@@ -158,3 +158,10 @@ Tests run offline by default against a recording stub of the DBS client, so no
 grid credentials are needed. Fixtures are modeled on live-measured DBS
 behavior, including a VALID dataset that holds invalid files and a campaign
 whose block totals are wrong without a status intersect.
+
+`tests/golden/` holds a different kind of check: twenty real questions about
+the CMS catalog with verified answers and the rule that decides pass or fail.
+`pytest` does not run them — they need a live chat with this server attached,
+because they measure the whole path from question to answer, not just the
+tool. That is where the pass counts quoted in the pull request come from, and
+it is deliberately re-runnable so the numbers can be argued with.
