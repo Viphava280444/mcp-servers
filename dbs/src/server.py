@@ -814,6 +814,11 @@ def dbs_aggregate(
     many datasets match this pattern". `pattern` is a dataset wildcard such as
     /*/HIRun2026A*/AOD. `status` must be explicit ('VALID', 'INVALID', '*',
     ...) because the DBS default silently hides everything that is not VALID.
+    Explicit is not the same as widest: use 'VALID' for how-big and what-does-
+    it-contain questions, and '*' only when the question is about existence or
+    about other statuses. Non-valid datasets are failed and superseded
+    production attempts; counting them into a size inflates it, measured at
+    nine times over on one campaign.
     `group_by` is auto|none|tier|stream|version|status. Dataset, byte, file
     and block counts always come back together, because one block scan pays
     for all four; add "events" to `metrics` to also pay one call per dataset

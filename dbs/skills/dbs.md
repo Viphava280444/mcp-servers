@@ -38,9 +38,24 @@ system could also add them up.
 ## Server traps (why the task tools exist)
 
 1. **VALID is a silent default.** A dataset query with no status filter shows
-   VALID datasets only, and never says so. Always pass a status explicitly;
-   use `*` for all. Measured example: a Run2018 RAW pattern returns 372
-   datasets by default and 574 across all statuses.
+   VALID datasets only, and never says so. Always pass a status explicitly, so
+   the answer can state which one it used. Measured example: a Run2018 RAW
+   pattern returns 372 datasets by default and 574 across all statuses.
+
+   **Explicit does not mean widest.** Pick the status the question means:
+
+   | The question is about | Status |
+   |---|---|
+   | how big / how many events / how many files something is | `VALID` |
+   | what a campaign, era or dataset **contains** | `VALID` |
+   | whether something exists at all, or a name that found nothing | `*` |
+   | invalidated, deprecated or deleted data, or a status breakdown | `*` |
+
+   Default to `VALID`. Non-valid datasets are failed and superseded production
+   attempts; counting them into a size answer inflates it badly. Measured: the
+   Run3Winter24 GEN-SIM-RAW campaign is 40 datasets and 540.4 TB at `VALID`,
+   and 458 datasets and 4.88 PB at `*` — nine times too large, and the wrong
+   answer to "how big is this campaign".
 2. **`validFileOnly` is presence-checked.** Sending it as 0 behaves exactly
    like 1. All-file numbers require omitting the key entirely. The same flag
    also silently restricts to VALID/PRODUCTION datasets, so on an invalidated
