@@ -10,7 +10,8 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"
 dependencies = [
-  "mcp>=1.28.0",
+  # mcp 2.0 moved mcp.server.fastmcp, so an unpinned build stops booting.
+  "mcp>=1.28.0,<2",
   "dbs3-client>=4.0.19",
 ]
 

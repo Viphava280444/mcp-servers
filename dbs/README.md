@@ -19,6 +19,26 @@ that can reach any public method on `dbs.apis.dbsClient.DbsApi`.
 - `dbs_list_runs`: convenience wrapper for `listRuns`.
 - `dbs_block_dump`: convenience wrapper for `blockDump`.
 
+On top of these, four task tools answer common questions in one call. They
+handle the DBS traps (status defaults, per-run counting, invalid files) and
+return small, complete answers, so prefer them when one fits:
+
+- `dbs_summary`: one dataset or block — status, size, events, files, runs.
+- `dbs_aggregate`: totals for an era or campaign, grouped by tier, status,
+  or version.
+- `dbs_run_summary`: events, files and bytes per run.
+- `dbs_run_coverage`: which runs one dataset has that another is missing.
+
+Two behaviors to know:
+
+- Every reply is capped (256 KB by default). A cut list says so:
+  `truncated: showing 623 of 7759 records`.
+- The server always asks DBS for gzip responses. Without this, big listings
+  cannot finish before DBS closes the stream at ~302 seconds.
+
+`skills/dbs.md` holds four short answer rules for the model. Each rule is
+there because removing it made benchmark answers measurably worse.
+
 ## Configuration
 
 The server reads configuration from environment variables:
@@ -26,8 +46,8 @@ The server reads configuration from environment variables:
 - `DBS_URL`: DBS service URL. Defaults to
   `https://cmsweb.cern.ch/dbs/prod/global/DBSReader/`.
 - `DBS_PROXY`: optional SOCKS5 proxy URL.
-- `X509_USER_CERT`: optional path to a user certificate.
-- `X509_USER_KEY`: optional path to a private key.
+- `X509_USER_PROXY`: optional path to a grid proxy, passed to DBS as both
+  `key` and `cert`.
 - `X509_CERT_DIR`: optional CA certificate directory, passed to DBS as
   `ca_info`.
 - `DBS_VERIFY_PEER`: set to `0`, `false`, or `no` to disable peer
@@ -40,6 +60,18 @@ The server reads configuration from environment variables:
   aggregation helpers.
 - `DBS_USE_GZIP`: set to `1`, `true`, or `yes` to gzip POST bodies.
 - `DBS_DEBUG`: set to `1`, `true`, or `yes` to print DBS HTTP debug output.
+
+New in this version:
+
+- `MCP_HOST`, `MCP_PORT`: server bind address and port. Default `0.0.0.0`
+  and `8013`.
+- `DBS_RESULT_CAP_BYTES`: reply size cap. Defaults to `262144`.
+- `DBS_CURL_TIMEOUT_S`: hang guard per HTTP call. Defaults to `240`.
+- `DBS_SCAN_BUDGET_S`: time budget for multi-call scans. Defaults to `100`.
+  When it runs out, the reply says `scanned: false` instead of guessing.
+
+More scan knobs (workers, chunk sizes, per-tool budgets) are read in
+`src/utils.py`.
 
 Read-only DBS endpoints often work with the default reader URL. Write/update
 operations generally require valid CERN X.509 credentials.
@@ -63,7 +95,8 @@ retry.
 DBS_URL=https://cmsweb.cern.ch/dbs/prod/global/DBSReader/ dbs-mcp
 ```
 
-The server uses stdio transport, which is what desktop MCP clients expect.
+The server uses streamable HTTP transport and listens on port `8013` by
+default. The Dockerfile builds the same thing as a container.
 
 ## Example MCP Client Configuration
 
@@ -71,10 +104,7 @@ The server uses stdio transport, which is what desktop MCP clients expect.
 {
   "mcpServers": {
     "dbs": {
-      "command": "/absolute/path/to/this/repo/.venv/bin/dbs-mcp",
-      "env": {
-        "DBS_URL": "https://cmsweb.cern.ch/dbs/prod/global/DBSReader/"
-      }
+      "url": "http://localhost:8013/mcp"
     }
   }
 }
