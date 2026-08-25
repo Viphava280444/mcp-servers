@@ -35,6 +35,7 @@ from src.utils import (
     _epoch_to_day,
     _first_row,
     _probe_wider_patterns,
+    _release_response,
     _resolve_runs,
     _rows,
     _run_exactness,
@@ -64,7 +65,26 @@ from src.utils import (  # noqa: F401
 
 host = os.getenv("MCP_HOST", "0.0.0.0")
 port = int(os.getenv("MCP_PORT", "8013"))
-mcp = FastMCP("dbs", host=host, port=port)
+# Stateful streamable-http retains one transport + one parked task per
+# session FOREVER (the mcp SDK has no default session TTL and FastMCP
+# passes none), so every probe or client that skips the DELETE leaks
+# ~60-120 KiB. Every tool here is unary request/response, so stateless
+# is semantically identical and leaks nothing.
+mcp = FastMCP(
+    "dbs",
+    host=host,
+    port=port,
+    stateless_http=_env_bool("MCP_STATELESS", True),
+    json_response=True,
+)
+
+
+@mcp.custom_route("/healthz", methods=["GET"])
+async def _healthz(_request: Any) -> Any:
+    # Probe target that never touches the MCP session path.
+    from starlette.responses import PlainTextResponse
+
+    return PlainTextResponse("ok")
 
 
 # ---------------------------------------------------------------------------
@@ -117,8 +137,10 @@ def _call_dbs_method(method_name: str, kwargs: dict[str, Any] | None = None,
     return call_dbs_method(_dbs_client(), method_name, kwargs=kwargs, payload=payload)
 
 
-def _scan_blocks(client: Any, pattern: str, names: list[str]) -> ScanResult:
-    return _lib_scan_blocks(client, pattern, names, fresh_client=_fresh_client)
+def _scan_blocks(client: Any, pattern: str, names: list[str],
+                 fold: Any = None) -> ScanResult:
+    return _lib_scan_blocks(client, pattern, names,
+                            fresh_client=_fresh_client, fold=fold)
 
 
 def _scan_runs(client: Any, dataset: str, runs: list[int],
@@ -921,8 +943,24 @@ def dbs_aggregate(
     # against the resolved names. The blocks API applies NO status filter, so
     # skipping the intersect overcounts by an unbounded factor.
     wanted_set = set(names)
-    scan = _scan_blocks(client, pattern, names)
-    blocks = scan.rows
+
+    # Folded in the scan workers: an era's block dicts (~300 MB) used to be
+    # accumulated in full and walked here, only to become three integers per
+    # group. Each worker now reduces its own rows and frees them.
+    counters: dict[str, dict[str, int]] = {}
+
+    def _fold(rows: list[dict[str, Any]]) -> None:
+        for block in rows:
+            owner = block.get("dataset")
+            if owner not in wanted_set:
+                continue
+            key = _group_of(owner, by_name[owner], group_by)
+            c = counters.setdefault(key, {"bytes": 0, "files": 0, "n_blocks": 0})
+            c["bytes"] += block.get("block_size") or 0
+            c["files"] += block.get("file_count") or 0
+            c["n_blocks"] += 1
+
+    scan = _scan_blocks(client, pattern, names, fold=_fold)
     calls += scan.calls
     missing_chunks = scan.unscanned + [f.split(":", 1)[0] for f in scan.failed]
     missing_tiers = {c.rsplit("/", 1)[-1] for c in missing_chunks}
@@ -936,15 +974,9 @@ def dbs_aggregate(
         if scan.failed:
             parts.append("DBS refused " + "; ".join(scan.failed))
         coverage["truncation_reason"] = "; ".join(parts)
-    for block in blocks:
-        owner = block.get("dataset")
-        if owner not in wanted_set:
-            continue
-        key = _group_of(owner, by_name[owner], group_by)
+    for key, c in counters.items():
         bucket = groups.setdefault(key, {"group": key, "n_datasets": 0, "datasets": []})
-        bucket["bytes"] = bucket.get("bytes", 0) + (block.get("block_size") or 0)
-        bucket["files"] = bucket.get("files", 0) + (block.get("file_count") or 0)
-        bucket["n_blocks"] = bucket.get("n_blocks", 0) + 1
+        bucket.update(c)
     coverage["n_summed"] = n_matched
 
     events_total = None
@@ -1034,7 +1066,22 @@ def dbs_aggregate(
                     f"{follow_up}. Call dbs_aggregate once per missing pattern and add "
                     "the results, or say which tiers are missing.")
 
+    # The singleton client pins the raw body of its last response (an era
+    # listing is tens of MB); hand the freed arenas back to the kernel too,
+    # or the scan's peak stays resident as glibc arena high-water.
+    _release_response(client)
+    _malloc_trim()
     return _agg_envelope(out_groups, totals, coverage, pattern, status, calls, hint)
+
+
+def _malloc_trim() -> None:
+    import gc
+    gc.collect()
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
 
 
 def main() -> None:

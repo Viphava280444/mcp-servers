@@ -8,6 +8,7 @@ imports mcp or server.py.
 from __future__ import annotations
 
 import os
+import threading
 import time
 from typing import Any
 
@@ -92,6 +93,25 @@ def _env_float(name: str, default: float) -> float:
         return float(value)
     except ValueError as exc:
         raise ValueError(f"{name} must be a number, got {value!r}") from exc
+
+
+def _release_response(client: Any) -> None:
+    """Drop the raw response body the DBS client keeps on the instance.
+
+    dbsClient sets self.http_response = <HTTPResponse> and never clears it,
+    and the long-lived pycurl handle pins the same BytesIO through its
+    WRITEFUNCTION. On the cached singleton that is one whole era listing
+    (tens of MB) held until the next call replaces it.
+    """
+    try:
+        client.http_response = None
+        curl = getattr(getattr(client, "rest_api", None), "_curl", None)
+        if curl is not None:
+            import pycurl
+            curl.setopt(pycurl.WRITEFUNCTION, lambda chunk: len(chunk))
+            curl.setopt(pycurl.HEADERFUNCTION, lambda chunk: len(chunk))
+    except Exception:
+        pass
 
 
 def build_client(api_class: Any) -> Any:
@@ -710,9 +730,15 @@ class ScanResult:
 
 
 def _scan_blocks(client: Any, pattern: str, names: list[str], *,
-                 fresh_client: Any) -> ScanResult:
+                 fresh_client: Any, fold: Any = None) -> ScanResult:
     """Block records for the pattern, inside a wall-clock budget: split per
-    tier, run concurrently, and whatever is missing is named, never zero."""
+    tier, run concurrently, and whatever is missing is named, never zero.
+
+    With `fold`, each worker hands its rows to fold(rows) under a lock and
+    frees them immediately; result.rows stays empty. Without it, an era
+    scan holds every tier's dicts simultaneously (~300 MB for HIRun2026A)
+    until the caller is done -- the dominant term in the aggregate's peak.
+    """
     result = ScanResult()
     chunk_min = _env_int("DBS_SCAN_CHUNK_MIN", 200)
     chunks = _tier_chunk_patterns(pattern, names) if (
@@ -736,12 +762,26 @@ def _scan_blocks(client: Any, pattern: str, names: list[str], *,
     budget = _env_float("DBS_SCAN_BUDGET_S", 100.0)
     workers = max(1, _env_int("DBS_SCAN_WORKERS", 6))
 
-    def one(chunk: str) -> list[dict[str, Any]]:
-        worker_client = client if workers == 1 else fresh_client()
-        return _rows(worker_client.listBlocks(dataset=chunk, detail=True))
+    fold_lock = threading.Lock()
 
-    def record(chunk: str, rows: list[dict[str, Any]]) -> None:
-        result.rows.extend(rows)
+    def one(chunk: str) -> list[dict[str, Any]] | int:
+        worker_client = client if workers == 1 else fresh_client()
+        try:
+            rows = _rows(worker_client.listBlocks(dataset=chunk, detail=True))
+            if fold is None:
+                return rows
+            n = len(rows)
+            with fold_lock:
+                fold(rows)
+            # The dicts die here, inside the worker, not after the scan.
+            rows.clear()
+            return n
+        finally:
+            _release_response(worker_client)
+
+    def record(chunk: str, rows: Any) -> None:
+        if fold is None:
+            result.rows.extend(rows)
 
     return scan_with_budget(chunks, one, record,
                             budget=budget, workers=workers, result=result)
