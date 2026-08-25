@@ -70,12 +70,19 @@ port = int(os.getenv("MCP_PORT", "8013"))
 # passes none), so every probe or client that skips the DELETE leaks
 # ~60-120 KiB. Every tool here is unary request/response, so stateless
 # is semantically identical and leaks nothing.
+# NOT stateless: the ToolHive vmcp gateway (v0.44.0) in front of this
+# server health-checks and calls through persistent MCP sessions, and a
+# stateless backend made it flap degraded/healthy and abort in-flight
+# calls (verified 2026-08-25: direct pod aggregate OK at 39.9 s, the
+# same call through the gateway 502 at 35-45 s, dbs log full of vmcp
+# requests answered 400). The leak is fixed by the session TTL in
+# main() below instead.
 mcp = FastMCP(
     "dbs",
     host=host,
     port=port,
-    stateless_http=_env_bool("MCP_STATELESS", True),
-    json_response=True,
+    stateless_http=_env_bool("MCP_STATELESS", False),
+    json_response=_env_bool("MCP_JSON_RESPONSE", False),
 )
 
 
@@ -1085,9 +1092,18 @@ def _malloc_trim() -> None:
 
 
 def main() -> None:
-    mcp.run(
-        transport="streamable-http",
-    )
+    import uvicorn
+
+    # streamable_http_app() constructs the session manager as a side effect.
+    app = mcp.streamable_http_app()
+    # The SDK reaps idle sessions only when session_idle_timeout is set,
+    # and FastMCP's constructor never passes it -- so by default every
+    # session a client abandons without DELETE lives FOREVER (~60-120 KiB
+    # each; our own probes leaked 2/min and OOM-killed this server after
+    # 4 days). 30 minutes bounds the abandoned set to a few MiB.
+    mcp._session_manager.session_idle_timeout = _env_float(
+        "MCP_SESSION_IDLE_TIMEOUT_S", 1800.0)
+    uvicorn.run(app, host=host, port=port)
 
 
 if __name__ == "__main__":
