@@ -8,7 +8,6 @@ imports mcp or server.py.
 from __future__ import annotations
 
 import os
-import threading
 import time
 from typing import Any
 
@@ -665,16 +664,20 @@ def _probe_wider_patterns(client: Any, pattern: str,
 # ---------------------------------------------------------------------------
 
 def scan_with_budget(items: list[Any], one: Any, record: Any, *,
-                     budget: float, workers: int, result: Any) -> Any:
+                     budget: float, workers: int, result: Any,
+                     processes: bool = False) -> Any:
     """Run `one` over `items` until the budget is spent, naming what was left.
 
     Everything not reached lands on result.unscanned, so a partial answer can
     never read as a whole one. `record(item, value)` is the only thing the two
     scanners do differently. `result` is the caller's own, returned as-is.
+
+    With `processes`, each item runs in a CHILD process and `one` must be
+    picklable (a module-level function or a partial of one).
     """
     started = time.monotonic()
 
-    if workers == 1:
+    if workers == 1 and not processes:
         for index, item in enumerate(items):
             if index and budget > 0 and time.monotonic() - started >= budget:
                 result.unscanned.extend(items[index:])
@@ -695,7 +698,23 @@ def scan_with_budget(items: list[Any], one: Any, record: Any, *,
     # so `with` would wait out the very stall the budget exists to escape.
     # shutdown(wait=False) lets this return on time; the stragglers finish into
     # results nobody reads and then exit.
-    pool = ThreadPoolExecutor(max_workers=min(workers, len(items)))
+    if processes:
+        # json.loads holds the GIL for its whole parse, and one whole-pp-era
+        # tier freezes this process for tens of seconds — probes, health
+        # checks, and the gateway's SSE control streams all starve, and the
+        # gateway then kills the in-flight call (observed 2026-08-25 on
+        # /*/Run2025A*/*). A child pays the parse instead and returns three
+        # integers per group. spawn, not fork: the parent runs an event loop
+        # with live threads. max_tasks_per_child=1: the child exits after its
+        # chunk, returning the parse's whole footprint to the OS.
+        import multiprocessing
+        from concurrent.futures import ProcessPoolExecutor
+        pool: Any = ProcessPoolExecutor(
+            max_workers=min(workers, len(items)),
+            mp_context=multiprocessing.get_context("spawn"),
+            max_tasks_per_child=1)
+    else:
+        pool = ThreadPoolExecutor(max_workers=min(workers, len(items)))
     futures = {pool.submit(one, item): item for item in items}
     try:
         for future in as_completed(futures, timeout=budget if budget > 0 else None):
@@ -715,11 +734,98 @@ def scan_with_budget(items: list[Any], one: Any, record: Any, *,
     return result
 
 
+def fold_rows(rows: list[dict[str, Any]],
+              groups: dict[str, str]) -> dict[str, dict[str, int]]:
+    """Reduce block rows to per-group byte/file/block counters.
+
+    `groups` maps each wanted dataset name to its group key; rows whose
+    dataset is not in the map are dropped (the blocks API applies no status
+    filter, so this intersect is what keeps invalid datasets out).
+    """
+    counters: dict[str, dict[str, int]] = {}
+    for block in rows:
+        key = groups.get(block.get("dataset"))
+        if key is None:
+            continue
+        c = counters.setdefault(key, {"bytes": 0, "files": 0, "n_blocks": 0})
+        c["bytes"] += block.get("block_size") or 0
+        c["files"] += block.get("file_count") or 0
+        c["n_blocks"] += 1
+    return counters
+
+
+def _merge_counters(total: dict[str, dict[str, int]],
+                    part: dict[str, dict[str, int]]) -> None:
+    for key, c in part.items():
+        agg = total.setdefault(key, {"bytes": 0, "files": 0, "n_blocks": 0})
+        agg["bytes"] += c["bytes"]
+        agg["files"] += c["files"]
+        agg["n_blocks"] += c["n_blocks"]
+
+
+def _list_datasets_subprocess(kwargs: dict) -> list[tuple[str, Any]]:
+    """listDatasets in a child process, reduced to (name, access_type) pairs.
+
+    Module-level so spawn can pickle it; builds its own client from the
+    environment (see _scan_chunk_subprocess for why).
+    """
+    from dbs.apis.dbsClient import DbsApi  # only children pay this import
+    client = build_client(DbsApi)
+    rows = _rows(client.listDatasets(**kwargs))
+    return [(r.get("dataset"), r.get("dataset_access_type"))
+            for r in rows if r.get("dataset")]
+
+
+def list_datasets_slim(client: Any, kwargs: dict) -> list[dict[str, Any]]:
+    """Dataset name + access type for a pattern; the parse happens in a child
+    process when DBS_SCAN_PROCESSES is set.
+
+    On a census the detail listing is tens of MB, and its json.loads holds
+    the GIL for the whole parse — 16 s of server freeze measured 2026-08-25
+    on /*/Run2025A*/*. The aggregate reads exactly two fields per row
+    (dataset, dataset_access_type), so the child returns only those and the
+    IPC payload stays small.
+    """
+    if not _env_bool("DBS_SCAN_PROCESSES", False):
+        return _rows(client.listDatasets(**kwargs))
+    import multiprocessing
+    from concurrent.futures import ProcessPoolExecutor
+    pool = ProcessPoolExecutor(max_workers=1,
+                               mp_context=multiprocessing.get_context("spawn"),
+                               max_tasks_per_child=1)
+    try:
+        # Bounded by the curl hang guard plus spawn/import slack; a hung
+        # child must not hold the tool call forever.
+        pairs = pool.submit(_list_datasets_subprocess, kwargs).result(
+            timeout=_env_int("DBS_CURL_TIMEOUT_S", 240) + 60)
+    finally:
+        # Never join a possibly-hung child (same discipline as
+        # scan_with_budget): shutdown without waiting.
+        pool.shutdown(wait=False, cancel_futures=True)
+    return [{"dataset": n, "dataset_access_type": t} for n, t in pairs]
+
+
+def _scan_chunk_subprocess(chunk: str,
+                           groups: dict[str, str]) -> tuple[int, dict]:
+    """One chunk in a child process: fetch, parse, fold, exit.
+
+    Module-level so spawn can pickle it. Builds its own client from the
+    environment — the parent's client (and any test fake) is unreachable
+    from here, which is why the process path is opt-in via
+    DBS_SCAN_PROCESSES and tests run the thread path.
+    """
+    from dbs.apis.dbsClient import DbsApi  # only children pay this import
+    client = build_client(DbsApi)
+    rows = _rows(client.listBlocks(dataset=chunk, detail=True))
+    return len(rows), fold_rows(rows, groups)
+
+
 class ScanResult:
     """What a block scan managed to collect, and what it did not."""
 
     def __init__(self) -> None:
         self.rows: list[dict[str, Any]] = []
+        self.counters: dict[str, dict[str, int]] = {}  # fold_groups scans
         self.calls = 0
         self.failed: list[str] = []      # chunk patterns DBS refused
         self.unscanned: list[str] = []   # chunk patterns the budget cut off
@@ -730,14 +836,20 @@ class ScanResult:
 
 
 def _scan_blocks(client: Any, pattern: str, names: list[str], *,
-                 fresh_client: Any, fold: Any = None) -> ScanResult:
+                 fresh_client: Any,
+                 fold_groups: dict[str, str] | None = None) -> ScanResult:
     """Block records for the pattern, inside a wall-clock budget: split per
     tier, run concurrently, and whatever is missing is named, never zero.
 
-    With `fold`, each worker hands its rows to fold(rows) under a lock and
-    frees them immediately; result.rows stays empty. Without it, an era
-    scan holds every tier's dicts simultaneously (~300 MB for HIRun2026A)
-    until the caller is done -- the dominant term in the aggregate's peak.
+    With `fold_groups` (dataset name -> group key), each worker reduces its
+    own rows to per-group counters and frees them; result.counters carries
+    the merged totals and result.rows stays empty. Without it, an era scan
+    holds every tier's dicts simultaneously (~300 MB for HIRun2026A) until
+    the caller is done -- the dominant term in the aggregate's peak.
+
+    When DBS_SCAN_PROCESSES is set (production), the fold_groups path runs
+    each chunk in a child process so a giant parse can never freeze the
+    server process (GIL). Tests and the plain-rows path stay in-process.
     """
     result = ScanResult()
     chunk_min = _env_int("DBS_SCAN_CHUNK_MIN", 200)
@@ -762,29 +874,35 @@ def _scan_blocks(client: Any, pattern: str, names: list[str], *,
     budget = _env_float("DBS_SCAN_BUDGET_S", 100.0)
     workers = max(1, _env_int("DBS_SCAN_WORKERS", 6))
 
-    fold_lock = threading.Lock()
+    processes = fold_groups is not None and _env_bool("DBS_SCAN_PROCESSES",
+                                                      False)
 
-    def one(chunk: str) -> list[dict[str, Any]] | int:
+    def one(chunk: str) -> Any:
         worker_client = client if workers == 1 else fresh_client()
         try:
             rows = _rows(worker_client.listBlocks(dataset=chunk, detail=True))
-            if fold is None:
+            if fold_groups is None:
                 return rows
-            n = len(rows)
-            with fold_lock:
-                fold(rows)
+            value = (len(rows), fold_rows(rows, fold_groups))
             # The dicts die here, inside the worker, not after the scan.
             rows.clear()
-            return n
+            return value
         finally:
             _release_response(worker_client)
 
-    def record(chunk: str, rows: Any) -> None:
-        if fold is None:
-            result.rows.extend(rows)
+    if processes:
+        import functools
+        one = functools.partial(_scan_chunk_subprocess, groups=fold_groups)
+
+    def record(chunk: str, value: Any) -> None:
+        if fold_groups is None:
+            result.rows.extend(value)
+        else:
+            _merge_counters(result.counters, value[1])
 
     return scan_with_budget(chunks, one, record,
-                            budget=budget, workers=workers, result=result)
+                            budget=budget, workers=workers, result=result,
+                            processes=processes)
 
 
 class RunScanResult:

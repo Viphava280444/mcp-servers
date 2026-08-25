@@ -46,6 +46,7 @@ from src.utils import (
 )
 from src.utils import _scan_blocks as _lib_scan_blocks
 from src.utils import _scan_runs as _lib_scan_runs
+from src.utils import list_datasets_slim
 
 # Re-exported, not called here. These were reachable as server.<name> before
 # the library moved out, and callers -- the test suite included -- may still
@@ -145,9 +146,10 @@ def _call_dbs_method(method_name: str, kwargs: dict[str, Any] | None = None,
 
 
 def _scan_blocks(client: Any, pattern: str, names: list[str],
-                 fold: Any = None) -> ScanResult:
+                 fold_groups: dict[str, str] | None = None) -> ScanResult:
     return _lib_scan_blocks(client, pattern, names,
-                            fresh_client=_fresh_client, fold=fold)
+                            fresh_client=_fresh_client,
+                            fold_groups=fold_groups)
 
 
 def _scan_runs(client: Any, dataset: str, runs: list[int],
@@ -861,7 +863,12 @@ def dbs_aggregate(
     zero.
 
     The reply's size follows the number of GROUPS, never the number of
-    datasets, so it is safe on a whole era. Eras are selected by name pattern:
+    datasets, so the reply is safe on a whole era. The DURATION is not: a
+    whole-era scan takes 1-3 minutes wall clock, and most MCP clients abort
+    a tool call after 60 s (200 s at most for Claude Code). If your call
+    budget is under ~2 minutes, split the query per data tier
+    (/*/Run2025A*/RAW, /*/Run2025A*/AOD, ...) — each chunk finishes well
+    under a minute and the totals add. Eras are selected by name pattern:
     there is deliberately no era-name parameter, because the server ignores
     that filter and answers with the entire catalog.
     """
@@ -899,7 +906,9 @@ def dbs_aggregate(
     ds_kwargs: dict[str, Any] = {"dataset": pattern, "dataset_access_type": status}
     if (not count_only) or group_by == "status":
         ds_kwargs["detail"] = True
-    rows = _rows(client.listDatasets(**ds_kwargs))
+    # Parsed in a child process under DBS_SCAN_PROCESSES: a census detail
+    # listing is tens of MB and its json.loads froze this server for 16 s.
+    rows = list_datasets_slim(client, ds_kwargs)
     calls += 1
     names = [r.get("dataset") for r in rows if r.get("dataset")]
     by_name = {r.get("dataset"): r for r in rows}
@@ -947,27 +956,19 @@ def dbs_aggregate(
         return envelope
 
     # Sizes: one status-blind blocks scan per pattern, intersected client-side
-    # against the resolved names. The blocks API applies NO status filter, so
-    # skipping the intersect overcounts by an unbounded factor.
-    wanted_set = set(names)
-
+    # against the resolved names (the map's keys). The blocks API applies NO
+    # status filter, so skipping the intersect overcounts by an unbounded
+    # factor.
+    #
     # Folded in the scan workers: an era's block dicts (~300 MB) used to be
     # accumulated in full and walked here, only to become three integers per
-    # group. Each worker now reduces its own rows and frees them.
-    counters: dict[str, dict[str, int]] = {}
+    # group. Each worker reduces its own rows to counters and frees them —
+    # in a child PROCESS under DBS_SCAN_PROCESSES, so a giant parse cannot
+    # freeze this server's event loop (the map is picklable; a closure over
+    # by_name was not).
+    wanted_group = {n: _group_of(n, by_name[n], group_by) for n in names}
 
-    def _fold(rows: list[dict[str, Any]]) -> None:
-        for block in rows:
-            owner = block.get("dataset")
-            if owner not in wanted_set:
-                continue
-            key = _group_of(owner, by_name[owner], group_by)
-            c = counters.setdefault(key, {"bytes": 0, "files": 0, "n_blocks": 0})
-            c["bytes"] += block.get("block_size") or 0
-            c["files"] += block.get("file_count") or 0
-            c["n_blocks"] += 1
-
-    scan = _scan_blocks(client, pattern, names, fold=_fold)
+    scan = _scan_blocks(client, pattern, names, fold_groups=wanted_group)
     calls += scan.calls
     missing_chunks = scan.unscanned + [f.split(":", 1)[0] for f in scan.failed]
     missing_tiers = {c.rsplit("/", 1)[-1] for c in missing_chunks}
@@ -981,7 +982,7 @@ def dbs_aggregate(
         if scan.failed:
             parts.append("DBS refused " + "; ".join(scan.failed))
         coverage["truncation_reason"] = "; ".join(parts)
-    for key, c in counters.items():
+    for key, c in scan.counters.items():
         bucket = groups.setdefault(key, {"group": key, "n_datasets": 0, "datasets": []})
         bucket.update(c)
     coverage["n_summed"] = n_matched
